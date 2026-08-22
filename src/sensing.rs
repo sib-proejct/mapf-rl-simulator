@@ -87,14 +87,19 @@ impl SeededSensor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Velocity;
+    use crate::types::{Acceleration, Velocity};
 
     #[test]
     fn reading_is_a_pure_function_of_seed_robot_and_tick() {
         let robot_id = RobotId::new("robot-1").unwrap();
         let sensor = SeededSensor::new(19, &robot_id, SensorConfig::new(0.1, 0).unwrap());
-        let state =
-            RobotState::new(WorldPosition::new(1.0, 2.0).unwrap(), Velocity::ZERO, 0.0).unwrap();
+        let state = RobotState::new(
+            WorldPosition::new(1.0, 2.0).unwrap(),
+            Velocity::ZERO,
+            Acceleration::ZERO,
+            0.0,
+        )
+        .unwrap();
         let first = sensor.sense(ControlTick::ZERO, SimulationTimeMs::ZERO, state, false);
         let second = sensor.sense(ControlTick::ZERO, SimulationTimeMs::ZERO, state, false);
         assert_eq!(first, second);

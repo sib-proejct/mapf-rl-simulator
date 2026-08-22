@@ -4,10 +4,12 @@ use mapf_rl_simulator::safety::{SafetyConfig, SafetyOutcome, SafetyReason};
 use mapf_rl_simulator::scenario::{Scenario, demo_scenario};
 use mapf_rl_simulator::sensing::SensorConfig;
 use mapf_rl_simulator::simulation::{EngineConfig, ManualMonotonicClock};
-use mapf_rl_simulator::types::{RobotId, RobotState, ScenarioId, Velocity, WorldPosition};
+use mapf_rl_simulator::types::{
+    Acceleration, RobotId, RobotState, ScenarioId, Velocity, WorldPosition,
+};
 use mapf_rl_simulator::world::{GridCell, GridMap};
 
-const DEMO_GOLDEN_DIGEST: &str = "2d52c86f4c64d327b436cda825f8859d771558309e7bf2e1dfe6477251ad82fe";
+const DEMO_GOLDEN_DIGEST: &str = "67bf8a9ed0dd2af9212c6b659eaae9677d3709eeaadcd9286874304e321aa6f6";
 
 #[test]
 fn same_scenario_and_seed_match_the_golden_digest() {
@@ -26,7 +28,8 @@ fn same_scenario_and_seed_match_the_golden_digest() {
 #[test]
 fn invalid_action_is_substituted_with_wait() {
     let mut scenario = open_scenario(vec![2, 77]);
-    scenario.engine_config.motion_limits = MotionLimits::new(1.0, 10.0, 10.0, 20.0).unwrap();
+    scenario.engine_config.motion_limits =
+        MotionLimits::new(1.0, 10.0, 10.0, 20.0, 100.0, 200.0).unwrap();
     let result = scenario.run(ManualMonotonicClock::default()).unwrap();
     let invalid = &result.records[1];
 
@@ -34,7 +37,11 @@ fn invalid_action_is_substituted_with_wait() {
     assert_eq!(invalid.applied_action as u8, 0);
     assert_eq!(invalid.safety_outcome, SafetyOutcome::SubstituteWait);
     assert_eq!(invalid.safety_reason, SafetyReason::InvalidAction);
-    assert_eq!(invalid.state.velocity(), Velocity::ZERO);
+    assert!(invalid.state.velocity().magnitude() <= 1.0);
+    assert!(
+        invalid.state.acceleration().magnitude()
+            < result.records[0].state.acceleration().magnitude()
+    );
 }
 
 #[test]
@@ -48,8 +55,9 @@ fn predicted_collision_is_blocked_before_motion_integration() {
     )
     .unwrap();
     let initial_state = RobotState::new(
-        WorldPosition::new(1.6, 1.5).unwrap(),
+        WorldPosition::new(1.4, 1.5).unwrap(),
         Velocity::new(2.0, 0.0).unwrap(),
+        Acceleration::ZERO,
         0.0,
     )
     .unwrap();
@@ -61,7 +69,7 @@ fn predicted_collision_is_blocked_before_motion_integration() {
         map,
         initial_state,
         engine_config: EngineConfig {
-            motion_limits: MotionLimits::new(2.0, 10.0, 10.0, 20.0).unwrap(),
+            motion_limits: MotionLimits::new(2.0, 10.0, 10.0, 20.0, 100.0, 200.0).unwrap(),
             safety: SafetyConfig::new(0.2, 0.05).unwrap(),
             sensor: SensorConfig::new(0.0, 0).unwrap(),
         },
@@ -73,8 +81,8 @@ fn predicted_collision_is_blocked_before_motion_integration() {
 
     assert_eq!(record.safety_outcome, SafetyOutcome::SubstituteWait);
     assert_eq!(record.safety_reason, SafetyReason::StaticObstacleClearance);
-    assert!((record.state.position().x_meters() - 1.7).abs() < 1.0e-12);
-    assert_eq!(record.state.velocity(), Velocity::new(1.0, 0.0).unwrap());
+    assert!(record.state.position().x_meters() < 1.75);
+    assert!(record.state.velocity().x_mps() < initial_state.velocity().x_mps());
 }
 
 #[test]
@@ -90,6 +98,7 @@ fn stopping_envelope_rejects_a_candidate_while_the_next_pose_is_still_clear() {
     let initial_state = RobotState::new(
         WorldPosition::new(1.5, 1.5).unwrap(),
         Velocity::new(1.0, 0.0).unwrap(),
+        Acceleration::ZERO,
         0.0,
     )
     .unwrap();
@@ -101,7 +110,7 @@ fn stopping_envelope_rejects_a_candidate_while_the_next_pose_is_still_clear() {
         map,
         initial_state,
         engine_config: EngineConfig {
-            motion_limits: MotionLimits::new(2.0, 10.0, 10.0, 20.0).unwrap(),
+            motion_limits: MotionLimits::new(2.0, 10.0, 10.0, 20.0, 100.0, 200.0).unwrap(),
             safety: SafetyConfig::new(0.2, 0.05).unwrap(),
             sensor: SensorConfig::new(0.0, 0).unwrap(),
         },
@@ -115,16 +124,18 @@ fn stopping_envelope_rejects_a_candidate_while_the_next_pose_is_still_clear() {
         .records[0];
     assert_eq!(record.safety_outcome, SafetyOutcome::SubstituteWait);
     assert_eq!(record.safety_reason, SafetyReason::StaticObstacleClearance);
-    assert_eq!(record.state.position(), initial_state.position());
-    assert_eq!(record.state.velocity(), Velocity::ZERO);
+    assert!(record.state.position().x_meters() > initial_state.position().x_meters());
+    assert!(record.state.position().x_meters() < 1.75);
+    assert!(record.state.velocity().x_mps() < initial_state.velocity().x_mps());
 }
 
 #[test]
 fn controlled_and_emergency_stops_integrate_distinct_stopping_distances() {
-    let mut controlled = open_scenario(vec![2; 4]);
+    let mut controlled = open_scenario(vec![2; 8]);
     controlled.initial_state = RobotState::new(
         WorldPosition::new(4.5, 4.5).unwrap(),
         Velocity::new(1.0, 0.0).unwrap(),
+        Acceleration::ZERO,
         0.0,
     )
     .unwrap();
@@ -135,12 +146,13 @@ fn controlled_and_emergency_stops_integrate_distinct_stopping_distances() {
         controlled_record.safety_outcome,
         SafetyOutcome::ControlledStop
     );
-    assert!((controlled_record.state.velocity().x_mps() - 0.7).abs() < 1.0e-12);
-    assert!((controlled_record.state.position().x_meters() - 4.57).abs() < 1.0e-12);
     assert_eq!(controlled_result.final_state.velocity(), Velocity::ZERO);
-    assert!((controlled_result.final_state.position().x_meters() - 4.62).abs() < 1.0e-12);
+    assert_eq!(
+        controlled_result.final_state.acceleration(),
+        Acceleration::ZERO
+    );
 
-    let mut emergency = open_scenario(vec![2, 2]);
+    let mut emergency = open_scenario(vec![2; 8]);
     emergency.initial_state = controlled.initial_state;
     emergency.fault_specs = vec![FaultSpec::once(0, "emergency", FaultKind::EmergencyStop)];
     let result = emergency.run(ManualMonotonicClock::default()).unwrap();
@@ -148,13 +160,19 @@ fn controlled_and_emergency_stops_integrate_distinct_stopping_distances() {
         result.records[0].safety_outcome,
         SafetyOutcome::EmergencyStop
     );
-    assert!((result.records[0].state.velocity().x_mps() - 0.4).abs() < 1.0e-12);
     assert_eq!(
         result.records[1].safety_outcome,
         SafetyOutcome::EmergencyStop
     );
-    assert_eq!(result.records[1].state.velocity(), Velocity::ZERO);
-    assert!((result.final_state.position().x_meters() - 4.54).abs() < 1.0e-12);
+    assert_eq!(result.final_state.velocity(), Velocity::ZERO);
+    assert_eq!(result.final_state.acceleration(), Acceleration::ZERO);
+    assert!(
+        controlled_record.state.velocity().x_mps() > result.records[0].state.velocity().x_mps()
+    );
+    assert!(
+        controlled_result.final_state.position().x_meters()
+            > result.final_state.position().x_meters()
+    );
 }
 
 #[test]
@@ -199,10 +217,15 @@ fn open_scenario(action_indices: Vec<i32>) -> Scenario {
         master_seed: 42,
         robot_id: RobotId::new("robot-open").unwrap(),
         map: GridMap::new(9, 9, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, []).unwrap(),
-        initial_state: RobotState::new(WorldPosition::new(4.5, 4.5).unwrap(), Velocity::ZERO, 0.0)
-            .unwrap(),
+        initial_state: RobotState::new(
+            WorldPosition::new(4.5, 4.5).unwrap(),
+            Velocity::ZERO,
+            Acceleration::ZERO,
+            0.0,
+        )
+        .unwrap(),
         engine_config: EngineConfig {
-            motion_limits: MotionLimits::new(1.0, 2.0, 3.0, 6.0).unwrap(),
+            motion_limits: MotionLimits::new(1.0, 2.0, 3.0, 6.0, 30.0, 60.0).unwrap(),
             safety: SafetyConfig::new(0.2, 0.05).unwrap(),
             sensor: SensorConfig::new(0.0, 0).unwrap(),
         },

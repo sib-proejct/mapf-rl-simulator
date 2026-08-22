@@ -1,7 +1,7 @@
 use crate::action::ActionAdapter;
 use crate::contracts::generated::ActionCandidate;
 use crate::fault::{FaultInjector, FaultSpec, ScheduledFault};
-use crate::motion::MotionLimits;
+use crate::motion::{MotionLimits, initial_kinematics_are_valid};
 use crate::safety::{SafetyError, SafetyKernel, SafetyOutcome, SafetyReason};
 use crate::sensing::{SeededSensor, SensorConfig, SensorReading};
 use crate::types::{
@@ -100,9 +100,7 @@ impl<C: MonotonicClock> SimulationEngine<C> {
         if !safety.state_is_clear(&map, initial_state) {
             return Err(EngineError::UnsafeInitialState);
         }
-        if initial_state.velocity().magnitude()
-            > config.motion_limits.max_linear_speed_mps() + crate::types::SAFETY_EPSILON_METERS
-        {
+        if !initial_kinematics_are_valid(initial_state, config.motion_limits) {
             return Err(EngineError::InvalidInitialKinematics);
         }
         if !safety.state_has_safe_emergency_stop(&map, initial_state, config.motion_limits) {
@@ -252,7 +250,7 @@ impl fmt::Display for EngineError {
                 formatter.write_str("initial circle footprint is not collision-free")
             }
             Self::InvalidInitialKinematics => {
-                formatter.write_str("initial robot velocity exceeds motion capability")
+                formatter.write_str("initial robot velocity or acceleration is invalid")
             }
             Self::UnsafeInitialStoppingEnvelope => {
                 formatter.write_str("initial robot state has no collision-free emergency stop")
@@ -273,17 +271,22 @@ mod tests {
     use crate::motion::MotionLimits;
     use crate::safety::{SafetyConfig, SafetyOutcome};
     use crate::sensing::SensorConfig;
-    use crate::types::{Velocity, WorldPosition};
+    use crate::types::{Acceleration, Velocity, WorldPosition};
     use crate::world::GridCell;
 
     #[test]
     fn clock_is_injected_but_does_not_advance_simulation_time() {
         let clock = ManualMonotonicClock::new(5);
         let map = GridMap::new(3, 3, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, []).unwrap();
-        let state =
-            RobotState::new(WorldPosition::new(1.5, 1.5).unwrap(), Velocity::ZERO, 0.0).unwrap();
+        let state = RobotState::new(
+            WorldPosition::new(1.5, 1.5).unwrap(),
+            Velocity::ZERO,
+            Acceleration::ZERO,
+            0.0,
+        )
+        .unwrap();
         let config = EngineConfig {
-            motion_limits: MotionLimits::new(1.0, 1.0, 1.0, 2.0).unwrap(),
+            motion_limits: MotionLimits::new(1.0, 1.0, 1.0, 2.0, 10.0, 20.0).unwrap(),
             safety: SafetyConfig::new(0.2, 0.05).unwrap(),
             sensor: SensorConfig::new(0.0, 0).unwrap(),
         };
@@ -313,10 +316,15 @@ mod tests {
             [GridCell::new(2, 1)],
         )
         .unwrap();
-        let initial_state =
-            RobotState::new(WorldPosition::new(0.5, 1.5).unwrap(), Velocity::ZERO, 0.0).unwrap();
+        let initial_state = RobotState::new(
+            WorldPosition::new(0.5, 1.5).unwrap(),
+            Velocity::ZERO,
+            Acceleration::ZERO,
+            0.0,
+        )
+        .unwrap();
         let config = EngineConfig {
-            motion_limits: MotionLimits::new(2.0, 10.0, 10.0, 20.0).unwrap(),
+            motion_limits: MotionLimits::new(2.0, 10.0, 10.0, 20.0, 100.0, 200.0).unwrap(),
             safety: SafetyConfig::new(0.2, 0.05).unwrap(),
             sensor: SensorConfig::new(0.0, 0).unwrap(),
         };
@@ -333,6 +341,7 @@ mod tests {
         let unsafe_state = RobotState::new(
             WorldPosition::new(1.8, 1.5).unwrap(),
             Velocity::new(2.0, 0.0).unwrap(),
+            Acceleration::ZERO,
             0.0,
         )
         .unwrap();
@@ -363,6 +372,7 @@ mod tests {
         let state = RobotState::new(
             WorldPosition::new(1.5, 1.5).unwrap(),
             Velocity::new(1.0, 0.0).unwrap(),
+            Acceleration::ZERO,
             0.0,
         )
         .unwrap();
@@ -372,7 +382,7 @@ mod tests {
             map,
             state,
             EngineConfig {
-                motion_limits: MotionLimits::new(2.0, 1.0, 1.0, 1.0).unwrap(),
+                motion_limits: MotionLimits::new(2.0, 1.0, 1.0, 1.0, 10.0, 10.0).unwrap(),
                 safety: SafetyConfig::new(0.2, 0.05).unwrap(),
                 sensor: SensorConfig::new(0.0, 0).unwrap(),
             },
@@ -384,5 +394,49 @@ mod tests {
             result,
             Err(EngineError::UnsafeInitialStoppingEnvelope)
         ));
+    }
+
+    #[test]
+    fn initial_acceleration_must_match_the_path_axis() {
+        let map = GridMap::new(5, 5, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, []).unwrap();
+        let config = EngineConfig {
+            motion_limits: MotionLimits::new(2.0, 2.0, 3.0, 6.0, 30.0, 60.0).unwrap(),
+            safety: SafetyConfig::new(0.2, 0.05).unwrap(),
+            sensor: SensorConfig::new(0.0, 0).unwrap(),
+        };
+        for state in [
+            RobotState::new(
+                WorldPosition::new(2.5, 2.5).unwrap(),
+                Velocity::ZERO,
+                Acceleration::new(0.1, 0.0).unwrap(),
+                0.0,
+            )
+            .unwrap(),
+            RobotState::new(
+                WorldPosition::new(2.5, 2.5).unwrap(),
+                Velocity::new(1.0, 0.0).unwrap(),
+                Acceleration::new(0.0, 0.1).unwrap(),
+                0.0,
+            )
+            .unwrap(),
+            RobotState::new(
+                WorldPosition::new(2.5, 2.5).unwrap(),
+                Velocity::new(1.0, 0.0).unwrap(),
+                Acceleration::new(4.0, 0.0).unwrap(),
+                0.0,
+            )
+            .unwrap(),
+        ] {
+            let result = SimulationEngine::new(
+                ManualMonotonicClock::default(),
+                RobotId::new("r1").unwrap(),
+                map.clone(),
+                state,
+                config,
+                1,
+                &[],
+            );
+            assert!(matches!(result, Err(EngineError::InvalidInitialKinematics)));
+        }
     }
 }

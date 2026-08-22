@@ -9,6 +9,7 @@ description = "Deterministic MAPF-RL virtual robot simulator"
 path = "src/lib.rs"
 
 [dependencies]
+ruckig = "=0.19.4"
 sha2 = "0.10"
 
 [dev-dependencies]

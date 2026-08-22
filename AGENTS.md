@@ -8,6 +8,9 @@
 
 ## Engineering rules
 
+- Prefer the simplest design that satisfies the current requirements. Do not add speculative abstractions, extension points, configuration, or layers without a concrete use case.
+- Handle errors at meaningful boundaries and where recovery or useful context is possible. Avoid broad, redundant, or defensive exception handling that hides programming errors or complicates the normal control flow.
+- Optimize code for readability and concision. Use direct control flow, clear names, and small focused units; avoid cleverness, unnecessary indirection, and duplicated ceremony.
 - Keep protocol handling, simulation state, policy inference, safety checks, and time progression in distinct modules.
 - Preserve determinism for the same scenario, seed, configuration, model artifact, and event sequence. Avoid wall-clock dependence in simulation logic; inject time and randomness.
 - Do not block Tokio executors with ONNX inference, heavy collision checks, filesystem access, or CPU-bound simulation work. Isolate blocking work explicitly.

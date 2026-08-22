@@ -47,6 +47,20 @@ impl MetersPerSecondSquared {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct MetersPerSecondCubed(f64);
+
+impl MetersPerSecondCubed {
+    pub fn new(value: f64) -> Result<Self, ValidationError> {
+        ensure_finite(value, "meters_per_second_cubed")?;
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct Radians(f64);
 
 impl Radians {
@@ -175,19 +189,44 @@ impl WorldPosition {
     pub const fn y_meters(self) -> f64 {
         self.y.get()
     }
-
-    pub(crate) fn translated(self, velocity: Velocity, dt_seconds: f64) -> Self {
-        Self {
-            x: Meters(self.x.get() + velocity.x.get() * dt_seconds),
-            y: Meters(self.y.get() + velocity.y.get() * dt_seconds),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Velocity {
     x: MetersPerSecond,
     y: MetersPerSecond,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Acceleration {
+    x: MetersPerSecondSquared,
+    y: MetersPerSecondSquared,
+}
+
+impl Acceleration {
+    pub const ZERO: Self = Self {
+        x: MetersPerSecondSquared(0.0),
+        y: MetersPerSecondSquared(0.0),
+    };
+
+    pub fn new(x_mps2: f64, y_mps2: f64) -> Result<Self, ValidationError> {
+        Ok(Self {
+            x: MetersPerSecondSquared::new(x_mps2)?,
+            y: MetersPerSecondSquared::new(y_mps2)?,
+        })
+    }
+
+    pub const fn x_mps2(self) -> f64 {
+        self.x.get()
+    }
+
+    pub const fn y_mps2(self) -> f64 {
+        self.y.get()
+    }
+
+    pub fn magnitude(self) -> f64 {
+        self.x.get().hypot(self.y.get())
+    }
 }
 
 impl Velocity {
@@ -220,6 +259,7 @@ impl Velocity {
 pub struct RobotState {
     position: WorldPosition,
     velocity: Velocity,
+    acceleration: Acceleration,
     yaw: Radians,
 }
 
@@ -227,11 +267,13 @@ impl RobotState {
     pub fn new(
         position: WorldPosition,
         velocity: Velocity,
+        acceleration: Acceleration,
         yaw_radians: f64,
     ) -> Result<Self, ValidationError> {
         Ok(Self {
             position,
             velocity,
+            acceleration,
             yaw: Radians::new(yaw_radians)?,
         })
     }
@@ -244,14 +286,24 @@ impl RobotState {
         self.velocity
     }
 
+    pub const fn acceleration(self) -> Acceleration {
+        self.acceleration
+    }
+
     pub const fn yaw_radians(self) -> f64 {
         self.yaw.get()
     }
 
-    pub(crate) const fn transitioned(self, position: WorldPosition, velocity: Velocity) -> Self {
+    pub(crate) const fn transitioned(
+        self,
+        position: WorldPosition,
+        velocity: Velocity,
+        acceleration: Acceleration,
+    ) -> Self {
         Self {
             position,
             velocity,
+            acceleration,
             yaw: self.yaw,
         }
     }

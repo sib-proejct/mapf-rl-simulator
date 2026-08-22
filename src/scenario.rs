@@ -1,12 +1,12 @@
 use crate::contracts::generated::CONTRACT_VERSION;
 use crate::fault::{FaultKind, FaultSpec};
-use crate::motion::MotionLimits;
+use crate::motion::{MotionLimits, RUCKIG_VERSION};
 use crate::safety::SafetyConfig;
 use crate::sensing::SensorConfig;
 use crate::simulation::{EngineConfig, EngineError, MonotonicClock, SimulationEngine, StepRecord};
 use crate::types::{
-    CONTROL_TICK_MS, RobotId, RobotState, ScenarioId, SimulationTimeMs, ValidationError, Velocity,
-    WorldPosition,
+    Acceleration, CONTROL_TICK_MS, RobotId, RobotState, ScenarioId, SimulationTimeMs,
+    ValidationError, Velocity, WorldPosition,
 };
 use crate::world::{GridCell, GridMap, MapError};
 use sha2::{Digest, Sha256};
@@ -133,13 +133,18 @@ pub fn demo_scenario() -> Result<Scenario, ScenarioError> {
     )?;
     Ok(Scenario {
         id: ScenarioId::new("phase1-demo")?,
-        version: "1.0.0".to_owned(),
+        version: "2.0.0".to_owned(),
         master_seed: 0x5eed_2026,
         robot_id: RobotId::new("robot-001")?,
         map,
-        initial_state: RobotState::new(WorldPosition::new(1.5, 2.5)?, Velocity::ZERO, 0.0)?,
+        initial_state: RobotState::new(
+            WorldPosition::new(1.5, 2.5)?,
+            Velocity::ZERO,
+            Acceleration::ZERO,
+            0.0,
+        )?,
         engine_config: EngineConfig {
-            motion_limits: MotionLimits::new(1.0, 2.0, 3.0, 6.0)?,
+            motion_limits: MotionLimits::new(1.0, 2.0, 3.0, 6.0, 30.0, 60.0)?,
             safety: SafetyConfig::new(0.2, 0.05)?,
             sensor: SensorConfig::new(0.01, 20_000)?,
         },
@@ -161,7 +166,9 @@ fn state_digest(
     final_time: SimulationTimeMs,
 ) -> String {
     let mut canonical = CanonicalDigest::new();
-    canonical.string("mapf-rl-simulator.phase1.state-digest.v1");
+    canonical.string("mapf-rl-simulator.phase1.state-digest.v2");
+    canonical.string("ruckig.velocity.path-axis-1d");
+    canonical.string(RUCKIG_VERSION);
     canonical.string(CONTRACT_VERSION);
     canonical.string(scenario.id.as_str());
     canonical.string(&scenario.version);
@@ -185,6 +192,13 @@ fn state_digest(
             .engine_config
             .motion_limits
             .max_emergency_deceleration_mps2(),
+    );
+    canonical.f64(scenario.engine_config.motion_limits.max_jerk_mps3());
+    canonical.f64(
+        scenario
+            .engine_config
+            .motion_limits
+            .max_emergency_jerk_mps3(),
     );
     canonical.f64(scenario.engine_config.safety.footprint_radius_meters());
     canonical.f64(
@@ -283,6 +297,8 @@ impl CanonicalDigest {
         self.position(value.position());
         self.f64(value.velocity().x_mps());
         self.f64(value.velocity().y_mps());
+        self.f64(value.acceleration().x_mps2());
+        self.f64(value.acceleration().y_mps2());
         self.f64(value.yaw_radians());
     }
 

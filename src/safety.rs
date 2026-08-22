@@ -1,11 +1,12 @@
 use crate::action::AdaptedAction;
 use crate::contracts::generated::ActionCandidate;
 use crate::motion::{
-    ActuatorEffect, MotionLimits, MotionPreview, preview_holonomic_motion, preview_stop,
+    ActuatorEffect, MotionLimits, MotionPreview, SweptSegment, preview_holonomic_motion,
+    preview_stop, preview_stop_trajectory,
 };
 use crate::types::{
-    Meters, RobotState, SAFETY_EPSILON_METERS, ValidationError, WorldPosition, ensure_non_negative,
-    ensure_positive,
+    CONTROL_TICK_SECONDS, Meters, RobotState, SAFETY_EPSILON_METERS, ValidationError,
+    WorldPosition, ensure_non_negative, ensure_positive,
 };
 use crate::world::GridMap;
 use std::fmt;
@@ -187,7 +188,7 @@ impl SafetyKernel {
                     );
                 }
             };
-        if !kinematics_are_valid(requested_preview, motion_limits) {
+        if !kinematics_are_valid(&requested_preview, motion_limits) {
             return self.controlled_stop_decision(
                 map,
                 state,
@@ -196,7 +197,7 @@ impl SafetyKernel {
                 motion_limits,
             );
         }
-        let requested_clearance = self.motion_clearance(map, requested_preview);
+        let requested_clearance = self.motion_clearance(map, &requested_preview);
         if !adapted.invalid_input()
             && requested_clearance.is_ok()
             && self.emergency_stopping_clear(map, requested_preview.next, motion_limits)
@@ -230,7 +231,7 @@ impl SafetyKernel {
                     );
                 }
             };
-        if !kinematics_are_valid(wait_preview, motion_limits) {
+        if !kinematics_are_valid(&wait_preview, motion_limits) {
             return self.emergency_stop_decision(
                 map,
                 state,
@@ -239,7 +240,7 @@ impl SafetyKernel {
                 motion_limits,
             );
         }
-        if self.motion_clearance(map, wait_preview).is_ok()
+        if self.motion_clearance(map, &wait_preview).is_ok()
             && self.emergency_stopping_clear(map, wait_preview.next, motion_limits)
         {
             Ok(SafetyDecision {
@@ -255,7 +256,7 @@ impl SafetyKernel {
     }
 
     pub fn state_is_clear(&self, map: &GridMap, state: RobotState) -> bool {
-        self.segment_clearance(map, state.position(), state.position())
+        self.segment_clearance(map, state.position(), state.position(), 0.0)
             .is_ok()
     }
 
@@ -276,10 +277,15 @@ impl SafetyKernel {
         reason: SafetyReason,
         limits: MotionLimits,
     ) -> Result<SafetyDecision, SafetyError> {
-        let preview = preview_stop(state, limits.max_deceleration_mps2(), limits)
-            .map_err(|_| SafetyError::NoSafeEmergencyTransition)?;
-        if kinematics_are_valid(preview, limits)
-            && self.motion_clearance(map, preview).is_ok()
+        let preview = preview_stop(
+            state,
+            limits.max_deceleration_mps2(),
+            limits.max_jerk_mps3(),
+            limits,
+        )
+        .map_err(|_| SafetyError::NoSafeEmergencyTransition)?;
+        if kinematics_are_valid(&preview, limits)
+            && self.motion_clearance(map, &preview).is_ok()
             && self.emergency_stopping_clear(map, preview.next, limits)
         {
             return Ok(SafetyDecision {
@@ -301,10 +307,15 @@ impl SafetyKernel {
         reason: SafetyReason,
         limits: MotionLimits,
     ) -> Result<SafetyDecision, SafetyError> {
-        let preview = preview_stop(state, limits.max_emergency_deceleration_mps2(), limits)
-            .map_err(|_| SafetyError::NoSafeEmergencyTransition)?;
-        if !kinematics_are_valid(preview, limits)
-            || self.motion_clearance(map, preview).is_err()
+        let preview = preview_stop(
+            state,
+            limits.max_emergency_deceleration_mps2(),
+            limits.max_emergency_jerk_mps3(),
+            limits,
+        )
+        .map_err(|_| SafetyError::NoSafeEmergencyTransition)?;
+        if !kinematics_are_valid(&preview, limits)
+            || self.motion_clearance(map, &preview).is_err()
             || !self.emergency_stopping_clear(map, preview.next, limits)
         {
             return Err(SafetyError::NoSafeEmergencyTransition);
@@ -324,22 +335,37 @@ impl SafetyKernel {
         state: RobotState,
         limits: MotionLimits,
     ) -> bool {
-        let velocity = state.velocity();
-        let speed = velocity.magnitude();
-        if speed == 0.0 {
-            return self.state_is_clear(map, state);
-        }
-        let stopping_distance = speed * speed / (2.0 * limits.max_emergency_deceleration_mps2());
-        let position = state.position();
-        let end = WorldPosition::new(
-            position.x_meters() + velocity.x_mps() / speed * stopping_distance,
-            position.y_meters() + velocity.y_mps() / speed * stopping_distance,
-        );
-        end.is_ok_and(|end| self.segment_clearance(map, position, end).is_ok())
+        preview_stop_trajectory(
+            state,
+            limits.max_emergency_deceleration_mps2(),
+            limits.max_emergency_jerk_mps3(),
+            limits,
+        )
+        .is_ok_and(|segments| {
+            segments
+                .iter()
+                .all(|segment| self.swept_segment_clear(map, *segment).is_ok())
+        })
     }
 
-    fn motion_clearance(&self, map: &GridMap, preview: MotionPreview) -> Result<(), SafetyReason> {
-        self.segment_clearance(map, preview.previous.position(), preview.next.position())
+    fn motion_clearance(&self, map: &GridMap, preview: &MotionPreview) -> Result<(), SafetyReason> {
+        preview
+            .swept_segments
+            .iter()
+            .try_for_each(|segment| self.swept_segment_clear(map, *segment))
+    }
+
+    fn swept_segment_clear(
+        &self,
+        map: &GridMap,
+        segment: SweptSegment,
+    ) -> Result<(), SafetyReason> {
+        self.segment_clearance(
+            map,
+            segment.start,
+            segment.end,
+            segment.curvature_margin_meters,
+        )
     }
 
     fn segment_clearance(
@@ -347,8 +373,9 @@ impl SafetyKernel {
         map: &GridMap,
         start: WorldPosition,
         end: WorldPosition,
+        trajectory_margin_meters: f64,
     ) -> Result<(), SafetyReason> {
-        let required = self.config.required_clearance();
+        let required = self.config.required_clearance() + trajectory_margin_meters;
         let (world_min_x, world_min_y, world_max_x, world_max_y) = map.world_bounds();
         for position in [start, end] {
             if position.x_meters() - world_min_x < required
@@ -370,12 +397,23 @@ impl SafetyKernel {
     }
 }
 
-fn kinematics_are_valid(preview: MotionPreview, limits: MotionLimits) -> bool {
-    let previous = preview.previous.velocity();
+fn kinematics_are_valid(preview: &MotionPreview, limits: MotionLimits) -> bool {
+    let previous_velocity = preview.previous.velocity();
     let next = preview.next.velocity();
-    let velocity_delta = (next.x_mps() - previous.x_mps()).hypot(next.y_mps() - previous.y_mps());
-    next.magnitude() <= limits.max_linear_speed_mps() + SAFETY_EPSILON_METERS
-        && velocity_delta <= preview.velocity_delta_limit_mps + SAFETY_EPSILON_METERS
+    let previous_acceleration = preview.previous.acceleration();
+    let next_acceleration = preview.next.acceleration();
+    let acceleration_delta = (next_acceleration.x_mps2() - previous_acceleration.x_mps2())
+        .hypot(next_acceleration.y_mps2() - previous_acceleration.y_mps2());
+    let acceleration_bound = previous_acceleration
+        .magnitude()
+        .max(preview.acceleration_limit_mps2);
+    let velocity_bound = previous_velocity
+        .magnitude()
+        .max(limits.max_linear_speed_mps());
+    next.magnitude() <= velocity_bound + SAFETY_EPSILON_METERS
+        && next_acceleration.magnitude() <= acceleration_bound + SAFETY_EPSILON_METERS
+        && acceleration_delta / CONTROL_TICK_SECONDS
+            <= preview.jerk_limit_mps3 + SAFETY_EPSILON_METERS
         && preview.previous.yaw_radians() == preview.next.yaw_radians()
 }
 
@@ -496,7 +534,7 @@ mod tests {
     use super::*;
     use crate::action::ActionAdapter;
     use crate::motion::ActuatorEffect;
-    use crate::types::{Velocity, WorldPosition};
+    use crate::types::{Acceleration, Velocity, WorldPosition};
     use crate::world::GridCell;
 
     #[test]
@@ -510,8 +548,9 @@ mod tests {
         )
         .unwrap();
         let state = RobotState::new(
-            WorldPosition::new(1.7, 1.5).unwrap(),
+            WorldPosition::new(1.4, 1.5).unwrap(),
             Velocity::new(2.0, 0.0).unwrap(),
+            Acceleration::ZERO,
             0.0,
         )
         .unwrap();
@@ -521,13 +560,13 @@ mod tests {
                 &map,
                 state,
                 ActionAdapter::from_index(2),
-                MotionLimits::new(2.0, 10.0, 10.0, 20.0).unwrap(),
+                MotionLimits::new(2.0, 10.0, 10.0, 20.0, 100.0, 200.0).unwrap(),
                 ActuatorEffect::nominal(),
                 false,
             )
             .unwrap();
-        assert_eq!(decision.outcome, SafetyOutcome::EmergencyStop);
-        assert_eq!(decision.next_state.position(), state.position());
-        assert_eq!(decision.next_state.velocity(), Velocity::ZERO);
+        assert_eq!(decision.outcome, SafetyOutcome::SubstituteWait);
+        assert_eq!(decision.reason, SafetyReason::StaticObstacleClearance);
+        assert!(decision.next_state.velocity().x_mps() < state.velocity().x_mps());
     }
 }

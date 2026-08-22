@@ -1,6 +1,6 @@
 # MAPF-RL Simulator 설계서
 
-> - 상태: Phase 1 deterministic engine 기준선 v0.3
+> - 상태: Phase 1 deterministic engine 기준선 v0.4
 > - 대상 저장소: `mapf-rl-simulator`
 > - 기준일: 2026-08-22
 > - 상위 기준: [`../../mapf-rl-docs/ARCHITECTURE.md`](../../mapf-rl-docs/ARCHITECTURE.md)
@@ -616,13 +616,15 @@ Virtual robot state는 최소 다음 의미를 구분한다.
 **확정 기본선**
 
 - Kinematics update는 pure transition `State × SafeAction × dt × FaultInput -> NextState`로 검증 가능하게 설계한다.
-- V1은 holonomic cardinal model과 semi-implicit Euler를 사용한다. Desired cardinal velocity는
-  `maxLinearSpeedMps`를 넘지 않는다. 같은 방향의 증속은 `maxAccelerationMps2`, 감속·방향 반전은
-  먼저 `maxDecelerationMps2`로 목표 속도 또는 0에 접근하고, 0에 도달한 다음 tick부터 새 방향으로
-  가속한다. `p_next = p + v_next × 0.1 s`로 적분하며 cardinal action은 yaw를 바꾸지 않는다.
-- `maxEmergencyDecelerationMps2 >= maxDecelerationMps2 > 0`을 시작 시 검증한다. Controlled stop은
-  제어 감속, Emergency stop은 비상 감속을 사용해 매 tick motion을 적분하며 정상 safety 경로에서
-  속도를 즉시 0으로 만들지 않는다. Motion과 Safety는 같은 rate-selection 규칙을 사용한다.
+- V1은 공식 Ruckig `0.19.4`의 velocity-control을 사용하는 jerk-limited holonomic cardinal model이다.
+  현재 이동 방향을 1-DoF 경로축으로 투영하고 Ruckig의 position, velocity와 acceleration 출력을 world
+  `x/y`로 변환한다. Desired cardinal velocity는 `maxLinearSpeedMps`를 넘지 않으며 방향이 바뀌면 기존
+  경로축에서 velocity와 acceleration이 0에 도달한 다음 tick부터 새 방향으로 가속한다. Cardinal
+  action은 yaw를 바꾸지 않는다.
+- `maxEmergencyDecelerationMps2 >= maxDecelerationMps2 > 0`과
+  `maxEmergencyJerkMps3 >= maxJerkMps3 > 0`을 시작 시 검증한다. Controlled stop과 Emergency stop은
+  각각의 감속·jerk limit로 Ruckig 궤적을 생성하며 정상 safety 경로에서 속도나 가속도를 즉시 0으로
+  만들지 않는다. Motion과 Safety는 같은 Ruckig trajectory를 사용한다.
 - Pose, velocity와 acceleration이 non-finite가 되면 즉시 incident와 stop으로 전환한다.
 - Footprint 전체를 사용해 static obstacle와 robot separation을 검사하며 center-point collision만으로 안전을 판단하지 않는다.
 - Collision이 발생한 상태는 metric 평균으로 상쇄할 수 없는 hard failure다.
@@ -859,9 +861,10 @@ RejectNotReady(reason)
 
 V1 footprint는 circle이다. Static check는 candidate center segment와 blocked-cell closed AABB 사이
 최소 거리를 계산하고 `radius + minimumObstacleClearance + 1e-9 m` 이상일 때만 accept한다.
-Candidate의 one-tick swept segment뿐 아니라 next state의 속도 방향으로
-`v² / (2 × maxEmergencyDecelerationMps2)`를 투영한 보수적 비상 정지 segment도 같은 clearance를
-통과해야 한다. Scenario 초기 state에도 동일한 stopping-envelope 검사를 적용한다.
+Candidate의 one-tick Ruckig trajectory뿐 아니라 next state의 velocity와 acceleration에서 시작하는
+전체 emergency Ruckig stop trajectory도 같은 clearance를 통과해야 한다. 궤적은 고정 구간으로
+표본화하고 각 chord에 `maxAcceleration × Δt² / 8`의 보수적 편차를 footprint clearance에 더한다.
+Scenario 초기 state에도 동일한 stopping-envelope 검사를 적용한다.
 Robot/dynamic check는 constant-velocity relative motion의 `[0, 2 s]` 연속 closest approach가 두 radius
 합 + minimum separation + `1e-9 m` 이상일 때만 accept한다. Map 밖과 boundary/tolerance 접촉은
 unsafe다. Floating-point epsilon을 call site마다 다르게 정의하지 않는다.
@@ -1126,7 +1129,7 @@ Simulator는 server가 아직 지원하지 않는 contract로 먼저 message를 
 ### Phase 1 — Deterministic single-robot engine
 
 - [x] Single-writer engine, fixed tick, world/map와 kinematics
-- [x] 방향 반전/감속, 제어·비상 감속 적분과 stopping-envelope safety kernel
+- [x] Ruckig jerk-limited 방향 반전/감속과 실제 stop-trajectory safety kernel
 - [x] Current-tick lazy fault injection과 spec/applied-event state digest regression
 - [x] Core 없이 실행 가능한 scenario harness
 
