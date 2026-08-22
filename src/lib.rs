@@ -1,5 +1,17 @@
-//! Contract-first scaffold for the MAPF-RL Simulator.
+//! Deterministic virtual-robot domain engine for the MAPF-RL Simulator.
 //!
-//! Motion, inference and safety runtime code is intentionally not present in Phase 0.
+//! The Phase 1 engine owns all authoritative state behind mutable access, advances
+//! simulation time in fixed 100 ms ticks, and applies motion only after the local
+//! deterministic safety kernel accepts it.
 
+pub mod action;
 pub mod contracts;
+pub mod fault;
+pub mod motion;
+pub mod random;
+pub mod safety;
+pub mod scenario;
+pub mod sensing;
+pub mod simulation;
+pub mod types;
+pub mod world;

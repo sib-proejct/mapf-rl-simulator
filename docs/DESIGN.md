@@ -1,6 +1,6 @@
 # MAPF-RL Simulator 설계서
 
-> - 상태: Phase 0 contract consumer 기준선 v0.2
+> - 상태: Phase 1 deterministic engine 기준선 v0.3
 > - 대상 저장소: `mapf-rl-simulator`
 > - 기준일: 2026-08-22
 > - 상위 기준: [`../../mapf-rl-docs/ARCHITECTURE.md`](../../mapf-rl-docs/ARCHITECTURE.md)
@@ -12,9 +12,10 @@
 
 이 문서는 시스템 아키텍처가 정한 책임 경계를 Simulator 내부의 구현 가능한 구조로 구체화한다. Core 통신, Order 적용, simulation time, virtual robot, local ONNX inference, deterministic safety, telemetry와 복구 사이의 의존성 및 최초 구현 기준선을 정의한다.
 
-현재 저장소에는 dependency-free Rust crate, generated contract representation과 compile/drift test만
-스캐폴딩되었다. Network, engine, motion, safety와 ONNX runtime은 아직 없다. Core가 소유한 wire
-schema의 field/path는 확정됐지만 runtime이 구현 완료되었다는 의미가 아니다.
+현재 저장소에는 generated contract representation과 compile/drift test에 더해 Phase 1의
+single-robot deterministic engine, motion/safety domain과 standalone scenario harness가 구현되었다.
+Network, Core session과 ONNX runtime은 아직 없다. Core가 소유한 wire schema의 field/path는
+확정됐지만 후속 runtime phase가 구현 완료되었다는 의미가 아니다.
 
 판단 표시는 다음과 같다.
 
@@ -534,13 +535,13 @@ Operator authorization과 audit의 권위자는 Core다. Simulator는 operator c
 
 각 control tick은 다음 고정 순서로 처리한다.
 
-1. Tick 경계까지 scheduled된 external/fault event를 deterministic order로 수집한다.
+1. Tick 경계까지 scheduled된 external event를 수집하고 fault spec은 현재 tick에 대해서만 deterministic하게 평가한다.
 2. Current `sessionEpoch`, Order/plan과 lifecycle command를 적용하고 emergency stop, communication timeout과 blocking fault를 pre-motion guard로 평가한다.
 3. Guard가 motion을 허용할 때만 current world snapshot에서 sensor와 controller observation을 생성한다.
 4. 해당 tick의 candidate를 계산하거나 inference timeout/failure outcome을 만든다. 대기 중 도착한 emergency/lifecycle event 또는 input state identity를 바꾸는 world event는 candidate보다 먼저 처리하고 invocation을 cancel 또는 stale 처리한다.
 5. Candidate 또는 failure fallback을 deterministic safety pipeline으로 평가해 이번 interval의 유일한 safe action을 결정한다.
-6. Safe action의 swept footprint와 kinematic transition을 검증한 뒤 `[t, t + dt)` 구간의 motion을 적분한다. Stop outcome이면 이전 action을 재사용하지 않는다.
-7. Static/dynamic collision invariant, finite state와 terminal condition을 검사하고 next world state를 원자적으로 commit한다.
+6. Safe action의 swept footprint, next-state 비상 정지 envelope와 kinematic transition을 검증한 뒤 `[t, t + dt)` 구간의 motion을 적분한다. Stop outcome도 configured 감속률로 위치와 속도를 적분하며 이전 action을 재사용하지 않는다.
+7. Static/dynamic collision invariant, finite state와 terminal condition을 검사하고 next world state를 원자적으로 commit한다. 비상 transition도 안전하지 않으면 state/time/fault를 commit하지 않고 scenario를 종료한다.
 8. State transition, command/application/activation ack, event, metric과 telemetry report intent를 생성한다.
 9. Simulation time을 정확히 한 tick 증가시킨다.
 
@@ -550,7 +551,7 @@ Simulation time은 inference result, timeout 또는 critical preemption outcome�
 
 **확정 기본선**
 
-- Scheduled event는 `(simulationTimeMs, eventClassPriority, stableSourceId, sourceSequence)`의 total order로 처리한다.
+- Scheduled event는 `(simulationTimeMs, eventClassPriority, stableSourceId, sourceSequence)`의 total order로 처리한다. Fault range는 미리 event 목록으로 materialize하지 않고 현재 tick의 spec만 stateless RNG로 평가한다.
 - 같은 tick에서는 new-session fencing, emergency stop와 motion-blocking fault/timeout이 activation과 inference result보다 먼저 처리되어야 한다. 전체 `eventClassPriority` 표는 versioned engine ADR과 regression fixture로 고정한다.
 - Inference를 기다리는 동안 도착한 critical external event는 현재 decision boundary의 ordered event로 기록하고 simulation time을 전진시키기 전에 적용한다.
 - 같은 tick의 robot iteration은 stable `robotId` 오름차순을 사용한다. 다른 tie-break가 필요한 contract는 version으로 명시한다.
@@ -569,7 +570,7 @@ Scenario 실행 결과는 최소 다음 identity를 기록한다.
 - contract version과 generated representation build identity
 - controller mode/identity/config digest와, Policy mode이면 policy identity/version/package digest 및 runtime version
 - Simulator source/build identity와 target platform
-- control tick과 fault schedule identity
+- control tick, fault spec identity와 실제 적용된 fault event
 - ordered external event log 또는 재구성 가능한 event source identity
 - terminal reason과 safety invariant result
 
@@ -616,8 +617,12 @@ Virtual robot state는 최소 다음 의미를 구분한다.
 
 - Kinematics update는 pure transition `State × SafeAction × dt × FaultInput -> NextState`로 검증 가능하게 설계한다.
 - V1은 holonomic cardinal model과 semi-implicit Euler를 사용한다. Desired cardinal velocity는
-  `maxLinearSpeedMps`, velocity vector는 acceleration/deceleration magnitude limit로 desired에
-  접근하고 `p_next = p + v_next × 0.1 s`로 적분한다. Cardinal action은 yaw를 바꾸지 않는다.
+  `maxLinearSpeedMps`를 넘지 않는다. 같은 방향의 증속은 `maxAccelerationMps2`, 감속·방향 반전은
+  먼저 `maxDecelerationMps2`로 목표 속도 또는 0에 접근하고, 0에 도달한 다음 tick부터 새 방향으로
+  가속한다. `p_next = p + v_next × 0.1 s`로 적분하며 cardinal action은 yaw를 바꾸지 않는다.
+- `maxEmergencyDecelerationMps2 >= maxDecelerationMps2 > 0`을 시작 시 검증한다. Controlled stop은
+  제어 감속, Emergency stop은 비상 감속을 사용해 매 tick motion을 적분하며 정상 safety 경로에서
+  속도를 즉시 0으로 만들지 않는다. Motion과 Safety는 같은 rate-selection 규칙을 사용한다.
 - Pose, velocity와 acceleration이 non-finite가 되면 즉시 incident와 stop으로 전환한다.
 - Footprint 전체를 사용해 static obstacle와 robot separation을 검사하며 center-point collision만으로 안전을 판단하지 않는다.
 - Collision이 발생한 상태는 metric 평균으로 상쇄할 수 없는 hard failure다.
@@ -642,7 +647,10 @@ Fault injection은 production code path를 우회하는 임의 mutation이 아�
 - inference delay/timeout/error/NaN/Infinity
 - artifact checksum/signature/schema failure
 
-Fault는 scenario seed, 발생 simulation time, target과 parameter를 기록한다. 실제 safety check를 끄는 fault option은 제공하지 않는다.
+Fault는 scenario seed, 발생 simulation time, target과 parameter를 기록한다. 각 spec의 전체 tick range를
+메모리에 생성하지 않고 현재 tick을 stateless RNG로 평가하며 actuator stuck 같은 지속 상태만 보존한다.
+Scenario digest에는 fault spec과 실제 적용 event를 기록하고 materialized future schedule은 포함하지 않는다.
+실제 safety check를 끄는 fault option은 제공하지 않는다.
 
 ## 12. Observation, policy inference와 action
 
@@ -830,7 +838,9 @@ RejectNotReady(reason)
 - `WAIT`도 collision, lifecycle와 kinematic 조건을 다시 통과해야 한다. Safe하지 않으면 stop한다.
 - Fallback은 `WAIT` 또는 stop만 허용하며 다른 방향으로 임의 우회하지 않는다.
 - Emergency stop과 blocking lifecycle/fault는 lower-priority candidate보다 우선한다.
-- Controlled stop의 deceleration과 emergency stop motion model은 versioned safety config로 분리한다.
+- Controlled stop은 제어 감속, Emergency stop은 비상 감속을 사용한다. 제어 감속 transition이 안전하지
+  않으면 비상 감속으로 승격하며, 비상 transition도 안전하지 않으면 `CollisionInvariant` hard failure로
+  종료하고 해당 tick의 state/time/fault를 부분 commit하지 않는다.
 - Core command, active plan 또는 policy가 safety outcome을 override할 수 없다.
 - Safety reject는 candidate/controller/inference identity, active policy가 있으면 그 identity, order/map/plan version, simulation time과 reason을 event로 보고한다.
 
@@ -849,6 +859,9 @@ RejectNotReady(reason)
 
 V1 footprint는 circle이다. Static check는 candidate center segment와 blocked-cell closed AABB 사이
 최소 거리를 계산하고 `radius + minimumObstacleClearance + 1e-9 m` 이상일 때만 accept한다.
+Candidate의 one-tick swept segment뿐 아니라 next state의 속도 방향으로
+`v² / (2 × maxEmergencyDecelerationMps2)`를 투영한 보수적 비상 정지 segment도 같은 clearance를
+통과해야 한다. Scenario 초기 state에도 동일한 stopping-envelope 검사를 적용한다.
 Robot/dynamic check는 constant-velocity relative motion의 `[0, 2 s]` 연속 closest approach가 두 radius
 합 + minimum separation + `1e-9 m` 이상일 때만 accept한다. Map 밖과 boundary/tolerance 접촉은
 unsafe다. Floating-point epsilon을 call site마다 다르게 정의하지 않는다.
@@ -1065,7 +1078,9 @@ Log, trace, event와 metric exemplar에는 가능한 범위에서 다음을 연�
 6. 구·신 Core와 Simulator version 조합
 7. Core-first rollout, Simulator rollback과 contract cleanup
 
-현재 `Cargo.toml`과 test tooling이 없으므로 `cargo fmt --check`, `cargo clippy` 또는 `cargo test`를 실행 성공으로 보고할 수 없다. Tooling이 추가되면 checked-in configuration과 README에서 정확한 명령과 flags를 기록한다.
+Checked-in `Cargo.toml`과 README를 기준으로 `cargo fmt --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets`를 검증 명령으로
+사용한다.
 
 ## 20. 배포와 운영
 
@@ -1102,18 +1117,18 @@ Simulator는 server가 아직 지원하지 않는 contract로 먼저 message를 
 
 ### Phase 0 — Contract와 Rust tooling
 
-- [x] Dependency-free Rust project와 실제 formatter/linter/test command 구성
+- [x] 최소 Rust project와 실제 formatter/linter/test command 구성
 - [x] Core OpenAPI/JSON Schema/fixture consumer 생성·lock·검증 pipeline
 - [x] Observation/action, map/capability, 100 ms motion과 safety geometry ADR
-- [ ] Runtime config/profile, typed unit/ID/time와 secret redaction은 Phase 1 code와 함께 추가
-- [ ] Full event-class priority와 RNG stream table은 Phase 1 deterministic engine ADR에서 확정
+- [x] Phase 1 domain의 typed unit/ID/time 추가. Runtime profile과 secret redaction은 Core session phase에서 추가
+- [x] Phase 1 event-class priority와 RNG stream table을 deterministic engine ADR에서 확정
 
 ### Phase 1 — Deterministic single-robot engine
 
-- Single-writer engine, fixed tick, world/map와 kinematics
-- Baseline `WAIT`/cardinal action adapter와 deterministic safety kernel
-- Seeded sensor/fault injection과 state digest regression
-- Core 없이 실행 가능한 scenario harness
+- [x] Single-writer engine, fixed tick, world/map와 kinematics
+- [x] 방향 반전/감속, 제어·비상 감속 적분과 stopping-envelope safety kernel
+- [x] Current-tick lazy fault injection과 spec/applied-event state digest regression
+- [x] Core 없이 실행 가능한 scenario harness
 
 ### Phase 2 — Core session vertical slice
 
@@ -1167,12 +1182,12 @@ Simulator는 server가 아직 지원하지 않는 contract로 먼저 message를 
 | Session | API key, `sessionEpoch`, process boot/global report sequence, per-report acceptance | auth, fencing, loss/reorder/reconnect |
 | Order/plan | consecutive `orderUpdateId`, `planRevisionId`, prepare barrier/dependency | duplicate/conflict/gap, partial ack/timeout |
 | Time/map | UTC, `simulationTimeMs`, SI와 확정 world/grid frame | boundary values, map digest, deterministic replay |
-| Engine | single writer, 100 ms tick/event total order, seeded streams | repeat-run digest와 scheduling stress |
+| Engine | single writer, 100 ms tick/event total order, seeded streams와 lazy fault range | repeat-run digest, 거대 range constant-memory 평가와 scheduling stress |
 | Controller | explicit baseline 또는 approved active policy, silent fallback 금지 | mode reconciliation, failure와 rollback |
 | Observation/action | exact four input tensors, five output index와 lowest-index tie | Python/Rust tensor/order/tie parity |
 | Policy | canonical integrity signature, deterministic archive, external digest/key rotation | secure archive, compatibility, golden vector |
 | Activation | stopped tick boundary, atomic pointer, predecessor rollback | late result, partial failure, withdrawal |
-| Safety | circle footprint/exact tolerance, 2초 continuous closest approach, `WAIT`/stop | fail-closed config, collision/invariant 0 |
+| Safety | circle footprint/exact tolerance, 제어·비상 감속, stopping envelope, 2초 continuous closest approach | 방향 반전/감속, 정지거리, fail-closed config와 collision/invariant 0 |
 | Telemetry | WS 10 Hz, bounded priority queue, replay/reconcile | overload, coalesce/drop evidence, critical delivery |
 | Security/config | profile priority, HTTPS/WSS, secret injection/redaction | missing/unknown config, key rotation/revocation |
 | Runtime | Compose local/dev, Kubernetes production, isolated CPU work | tick latency, executor starvation, shutdown/restart |
@@ -1199,6 +1214,8 @@ Simulator는 server가 아직 지원하지 않는 contract로 먼저 message를 
 - [ ] Staged package 검증은 active pointer 전환 전에 끝나며 activation ack는 실제 pointer commit 뒤에만 전송한다.
 - [ ] Policy output이 모든 deterministic safety step을 통과한다.
 - [ ] Missing/stale/NaN/Infinity/timeout은 `WAIT` 또는 stop으로 fail closed한다.
+- [ ] Candidate swept path와 next-state emergency stopping envelope를 모두 검증한다.
+- [ ] Controlled/Emergency stop은 각 감속률로 적분하며 unsafe emergency transition을 부분 commit하지 않는다.
 - [ ] Emergency stop은 latched이며 권한 있는 release와 cause-clear를 요구한다.
 - [ ] Critical report/ack/event는 queue overflow로 silent drop하지 않는다.
 - [ ] Disconnect/restart 후 full reconciliation 전 motion을 재개하지 않는다.

@@ -3,13 +3,13 @@ name = "mapf-rl-simulator"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "MAPF-RL Simulator contract-first scaffold"
+description = "Deterministic MAPF-RL virtual robot simulator"
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
 serde_json = "1.0"
-sha2 = "0.10"
