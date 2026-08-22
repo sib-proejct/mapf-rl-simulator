@@ -6,12 +6,18 @@
 
 pub mod action;
 pub mod contracts;
+pub mod controller;
+pub mod core_client;
 pub mod fault;
 pub mod motion;
+pub mod protocol;
 pub mod random;
+pub mod runtime;
 pub mod safety;
 pub mod scenario;
 pub mod sensing;
+pub mod session;
 pub mod simulation;
+pub mod spool;
 pub mod types;
 pub mod world;

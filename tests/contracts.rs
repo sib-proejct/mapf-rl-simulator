@@ -1,6 +1,7 @@
 use mapf_rl_simulator::contracts::generated::{
     ActionCandidate, CONTRACT_TREE_SHA256, CONTRACT_VERSION, WsMessageType,
 };
+use mapf_rl_simulator::protocol::{OrderCommand, ReportAck, ReportEnvelope};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -46,4 +47,32 @@ fn action_indices_and_message_names_are_stable() {
         WsMessageType::RobotStateReport.as_str(),
         "robot.state.report"
     );
+}
+
+#[test]
+fn phase2_core_fixtures_map_to_the_typed_consumer_boundary() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../mapf-rl-core/packages/contracts/fixtures/valid");
+
+    let order: OrderCommand = serde_json::from_slice(
+        &fs::read(fixtures.join("ws-order-command.json")).expect("fixture must be readable"),
+    )
+    .expect("Order fixture must deserialize");
+    order.validate().expect("Order fixture must validate");
+
+    for name in ["ws-command-ack.json", "ws-robot-state-report.json"] {
+        let report: ReportEnvelope = serde_json::from_slice(
+            &fs::read(fixtures.join(name)).expect("fixture must be readable"),
+        )
+        .expect("report fixture must deserialize");
+        report.validate().expect("report fixture must validate");
+    }
+
+    let acknowledgement: ReportAck = serde_json::from_slice(
+        &fs::read(fixtures.join("ws-report-ack.json")).expect("fixture must be readable"),
+    )
+    .expect("report ack fixture must deserialize");
+    acknowledgement
+        .validate()
+        .expect("report ack fixture must validate");
 }

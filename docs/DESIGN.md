@@ -1,6 +1,6 @@
 # MAPF-RL Simulator 설계서
 
-> - 상태: Phase 1 deterministic engine 기준선 v0.4
+> - 상태: Phase 2 Core session vertical slice 기준선 v0.5
 > - 대상 저장소: `mapf-rl-simulator`
 > - 기준일: 2026-08-22
 > - 상위 기준: [`../../mapf-rl-docs/ARCHITECTURE.md`](../../mapf-rl-docs/ARCHITECTURE.md)
@@ -12,10 +12,10 @@
 
 이 문서는 시스템 아키텍처가 정한 책임 경계를 Simulator 내부의 구현 가능한 구조로 구체화한다. Core 통신, Order 적용, simulation time, virtual robot, local ONNX inference, deterministic safety, telemetry와 복구 사이의 의존성 및 최초 구현 기준선을 정의한다.
 
-현재 저장소에는 generated contract representation과 compile/drift test에 더해 Phase 1의
-single-robot deterministic engine, motion/safety domain과 standalone scenario harness가 구현되었다.
-Network, Core session과 ONNX runtime은 아직 없다. Core가 소유한 wire schema의 field/path는
-확정됐지만 후속 runtime phase가 구현 완료되었다는 의미가 아니다.
+현재 저장소에는 generated contract representation과 compile/drift test, Phase 1의 single-robot
+deterministic engine 및 Phase 2의 authenticated Core session vertical slice가 구현되었다.
+Phase 2는 durable report spool, single Order 멱등 적용, 10 Hz WS state report와 5초 REST recovery를
+포함한다. Multi-robot plan과 ONNX runtime은 아직 없다.
 
 판단 표시는 다음과 같다.
 
@@ -1135,11 +1135,11 @@ Simulator는 server가 아직 지원하지 않는 contract로 먼저 message를 
 
 ### Phase 2 — Core session vertical slice
 
-- API key REST/WS auth, durable `sessionEpoch` consumer와 old-session fencing
-- Snapshot reconciliation, `simulatorBootId`/`reportSequence`
-- `local`/`dev` deterministic baseline controller의 명시적 선택과 identity report
-- Single Order update, application ack와 execution state 분리
-- WS 10 Hz report, reconnect, duplicate/reorder/gap과 5초 fallback polling
+- [x] API key REST/WS auth, durable `sessionEpoch` consumer와 old-session fencing
+- [x] Snapshot reconciliation, `simulatorBootId`/`reportSequence`
+- [x] `local`/`dev` deterministic baseline controller의 명시적 선택과 identity report
+- [x] Single Order update, application ack와 execution state 분리
+- [x] WS 10 Hz report, reconnect, duplicate/reorder/gap과 5초 fallback polling
 
 ### Phase 3 — Multi-robot plan과 recovery
 

@@ -1,0 +1,325 @@
+//! Async Phase 2 transport/session composition.
+
+use crate::core_client::{CoreClient, CoreClientError, CoreWebSocket};
+use crate::protocol::{OrderCommand, PoseReport, ReportAck, ReportEnvelope, StreamWelcome};
+use crate::session::{CoreSession, OrderDecision, SessionError, StreamSequenceDisposition};
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
+pub struct Phase2Runtime {
+    client: CoreClient,
+    session: Arc<Mutex<CoreSession>>,
+    websocket: Option<CoreWebSocket>,
+}
+
+impl Phase2Runtime {
+    pub fn new(client: CoreClient, session: CoreSession) -> Self {
+        Self {
+            client,
+            session: Arc::new(Mutex::new(session)),
+            websocket: None,
+        }
+    }
+
+    /// Authenticates the WebSocket, consumes the new epoch, reconciles through
+    /// authenticated REST, then replays every report still in the local spool.
+    pub async fn connect_and_replay(&mut self, monotonic_ms: u64) -> Result<(), RuntimeError> {
+        if let Err(error) = self.connect_inner().await {
+            self.websocket = None;
+            self.mark_disconnected(monotonic_ms).await?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn connect_inner(&mut self) -> Result<(), RuntimeError> {
+        let resume_after = self
+            .session_call(|session| Ok(session.resume_after()))
+            .await?;
+        let mut websocket = self.client.connect_websocket(resume_after).await?;
+        let welcome_value = websocket.next_json().await?;
+        let welcome: StreamWelcome = serde_json::from_value(welcome_value)?;
+        self.session_call(move |session| Ok(session.accept_welcome(welcome)?))
+            .await?;
+
+        let snapshot = self.client.fetch_snapshot().await?;
+        self.session_call(move |session| Ok(session.reconcile(&snapshot)?))
+            .await?;
+        let pending = self
+            .session_call(|session| Ok(session.spool().pending().to_vec()))
+            .await?;
+        for report in &pending {
+            websocket.write_report(report).await?;
+        }
+        self.websocket = Some(websocket);
+        Ok(())
+    }
+
+    /// Queues one periodic state projection if the injected monotonic schedule is
+    /// due, then writes it on the WS fast path. The durable copy remains pending.
+    pub async fn publish_state_if_due(
+        &mut self,
+        monotonic_ms: u64,
+        state_version: u64,
+        simulation_time_ms: i64,
+        pose: PoseReport,
+        occurred_at: String,
+    ) -> Result<bool, RuntimeError> {
+        let report = self
+            .session_call(move |session| {
+                if !session.state_report_due(monotonic_ms) {
+                    return Ok(None);
+                }
+                let message_id = session.queue_state_report(
+                    state_version,
+                    simulation_time_ms,
+                    pose,
+                    occurred_at,
+                )?;
+                Ok(session
+                    .spool()
+                    .pending()
+                    .iter()
+                    .find(|report| report.message_id == message_id)
+                    .cloned())
+            })
+            .await?;
+        let Some(report) = report else {
+            return Ok(false);
+        };
+        let Some(websocket) = self.websocket.as_mut() else {
+            return Ok(true);
+        };
+        if let Err(error) = websocket.write_report(&report).await {
+            self.websocket = None;
+            self.mark_disconnected(monotonic_ms).await?;
+            return Err(error.into());
+        }
+        Ok(true)
+    }
+
+    /// Handles one Core frame. Command application and its durable application ack
+    /// happen before `OrderApplied` is returned; execution is reported only by a
+    /// later periodic state report.
+    pub async fn receive_one(
+        &mut self,
+        monotonic_ms: u64,
+        occurred_at: String,
+    ) -> Result<RuntimeEvent, RuntimeError> {
+        let next = self
+            .websocket
+            .as_mut()
+            .ok_or(RuntimeError::Disconnected)?
+            .next_json()
+            .await;
+        let value = match next {
+            Ok(value) => value,
+            Err(error) => {
+                self.websocket = None;
+                self.mark_disconnected(monotonic_ms).await?;
+                return Err(error.into());
+            }
+        };
+        let message_type = value
+            .get("messageType")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(RuntimeError::InvalidCoreMessage)?;
+        match message_type {
+            "order.command" => {
+                let command: OrderCommand = serde_json::from_value(value)?;
+                let sequence = command.event_sequence;
+                let (stream, decision, acknowledgement) = self
+                    .session_call(move |session| {
+                        let stream = session.observe_stream_sequence(sequence);
+                        let decision = session.accept_order(&command, occurred_at)?;
+                        let acknowledgement = session
+                            .spool()
+                            .pending()
+                            .last()
+                            .cloned()
+                            .ok_or(RuntimeError::MissingApplicationAck)?;
+                        Ok((stream, decision, acknowledgement))
+                    })
+                    .await?;
+                if stream == StreamSequenceDisposition::Gap {
+                    return Err(RuntimeError::StreamGap);
+                }
+                if let Err(error) = self.write_without_accepting(&acknowledgement).await {
+                    self.websocket = None;
+                    self.mark_disconnected(monotonic_ms).await?;
+                    return Err(error);
+                }
+                Ok(RuntimeEvent::Order(decision))
+            }
+            "report.ack" => {
+                let acknowledgement: ReportAck = serde_json::from_value(value)?;
+                let sequence = acknowledgement.event_sequence;
+                let (stream, result) = self
+                    .session_call(move |session| {
+                        let stream = session.observe_stream_sequence(sequence);
+                        let result = session.accept_report_ack(&acknowledgement)?;
+                        Ok((stream, result))
+                    })
+                    .await?;
+                if stream == StreamSequenceDisposition::Gap {
+                    return Err(RuntimeError::StreamGap);
+                }
+                Ok(RuntimeEvent::ReportAcknowledged(result))
+            }
+            "stream.welcome" => Err(RuntimeError::UnexpectedWelcome),
+            _ => Err(RuntimeError::InvalidCoreMessage),
+        }
+    }
+
+    pub async fn mark_disconnected(&self, monotonic_ms: u64) -> Result<(), RuntimeError> {
+        self.session_call(move |session| {
+            session.mark_disconnected(monotonic_ms);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Five-second REST recovery path. It validates the authenticated snapshot and
+    /// submits bounded batches, applying the same Core acceptance rules as WS acks.
+    /// It never substitutes REST for 10 Hz telemetry generation.
+    pub async fn run_rest_fallback_if_due(&self, monotonic_ms: u64) -> Result<bool, RuntimeError> {
+        let due = self
+            .session_call(move |session| Ok(session.rest_fallback_due(monotonic_ms)))
+            .await?;
+        if !due {
+            return Ok(false);
+        }
+        let snapshot = self.client.fetch_snapshot().await?;
+        let (simulator_id, epoch) = self
+            .session_call(|session| {
+                Ok((
+                    session
+                        .spool()
+                        .pending()
+                        .first()
+                        .map(|report| report.simulator_id.clone()),
+                    session.session_epoch(),
+                ))
+            })
+            .await?;
+        if simulator_id
+            .as_deref()
+            .is_some_and(|id| id != snapshot.simulator_id)
+            || epoch != Some(snapshot.session_epoch)
+        {
+            return Err(RuntimeError::SnapshotMismatch);
+        }
+
+        let pending = self
+            .session_call(|session| Ok(session.spool().pending().to_vec()))
+            .await?;
+        for reports in pending.chunks(100) {
+            let outcome = self.client.submit_report_batch(reports).await?;
+            self.session_call(move |session| {
+                session.accept_report_batch(&outcome)?;
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(true)
+    }
+
+    async fn write_without_accepting(
+        &mut self,
+        report: &ReportEnvelope,
+    ) -> Result<(), RuntimeError> {
+        let websocket = self.websocket.as_mut().ok_or(RuntimeError::Disconnected)?;
+        websocket.write_report(report).await?;
+        Ok(())
+    }
+
+    async fn session_call<T, F>(&self, operation: F) -> Result<T, RuntimeError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut CoreSession) -> Result<T, RuntimeError> + Send + 'static,
+    {
+        let session = Arc::clone(&self.session);
+        tokio::task::spawn_blocking(move || {
+            let mut session = session
+                .lock()
+                .map_err(|_| RuntimeError::SessionWorkerPanicked)?;
+            operation(&mut session)
+        })
+        .await
+        .map_err(|_| RuntimeError::SessionWorkerPanicked)?
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeEvent {
+    Order(OrderDecision),
+    ReportAcknowledged(crate::spool::AckResult),
+}
+
+#[derive(Debug)]
+pub enum RuntimeError {
+    Core(CoreClientError),
+    Session(SessionError),
+    Json(serde_json::Error),
+    Disconnected,
+    InvalidCoreMessage,
+    MissingApplicationAck,
+    SessionWorkerPanicked,
+    SnapshotMismatch,
+    StreamGap,
+    UnexpectedWelcome,
+}
+
+impl From<CoreClientError> for RuntimeError {
+    fn from(value: CoreClientError) -> Self {
+        Self::Core(value)
+    }
+}
+
+impl From<SessionError> for RuntimeError {
+    fn from(value: SessionError) -> Self {
+        Self::Session(value)
+    }
+}
+
+impl From<serde_json::Error> for RuntimeError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
+    }
+}
+
+impl fmt::Display for RuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Core(error) => error.fmt(formatter),
+            Self::Session(error) => error.fmt(formatter),
+            Self::Json(error) => write!(formatter, "Core message JSON failed: {error}"),
+            Self::Disconnected => formatter.write_str("Core WebSocket is not connected"),
+            Self::InvalidCoreMessage => formatter.write_str("Core sent an unsupported message"),
+            Self::MissingApplicationAck => {
+                formatter.write_str("application ack was not durably spooled")
+            }
+            Self::SessionWorkerPanicked => formatter.write_str("blocking session worker failed"),
+            Self::SnapshotMismatch => {
+                formatter.write_str("REST fallback snapshot does not match the active session")
+            }
+            Self::StreamGap => {
+                formatter.write_str("Core stream sequence has a gap; reconciliation is required")
+            }
+            Self::UnexpectedWelcome => {
+                formatter.write_str("Core sent a second welcome in one WebSocket session")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Core(error) => Some(error),
+            Self::Session(error) => Some(error),
+            Self::Json(error) => Some(error),
+            _ => None,
+        }
+    }
+}

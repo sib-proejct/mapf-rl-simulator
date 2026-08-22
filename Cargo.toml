@@ -9,8 +9,17 @@ description = "Deterministic MAPF-RL virtual robot simulator"
 path = "src/lib.rs"
 
 [dependencies]
+futures-util = "0.3"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ruckig = "=0.19.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 sha2 = "0.10"
+tokio = { version = "1", features = ["net", "rt-multi-thread"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-serde_json = "1.0"
+tempfile = "3"
