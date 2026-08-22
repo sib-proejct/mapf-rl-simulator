@@ -1,0 +1,15 @@
+[package]
+name = "mapf-rl-simulator"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "MAPF-RL Simulator contract-first scaffold"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = "1.0"
+sha2 = "0.10"
