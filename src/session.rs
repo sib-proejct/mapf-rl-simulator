@@ -1,9 +1,10 @@
 //! Core session fencing, reconciliation, Order idempotency, and report scheduling.
 
 use crate::protocol::{
-    ActiveController, CommandAckPayload, CommandDisposition, MapIdentity, OrderCommand, OrderPhase,
-    PoseReport, Producer, ProducerKind, ReportAck, ReportBatchOutcome, ReportEnvelope,
-    ReportPayload, RobotStatePayload, SimulatorSnapshot, StreamWelcome,
+    ActiveController, CommandAckPayload, CommandDisposition, EventSeverity, MapIdentity,
+    OrderCommand, OrderPhase, PoseReport, Producer, ProducerKind, ReportAck, ReportBatchOutcome,
+    ReportEnvelope, ReportPayload, RobotEventPayload, RobotStatePayload, SimulatorSnapshot,
+    StreamWelcome,
 };
 use crate::spool::{AckResult, AppliedOrder, DurableSpool, SpoolError};
 use std::fmt;
@@ -96,6 +97,10 @@ impl CoreSession {
 
     pub fn spool(&self) -> &DurableSpool {
         &self.spool
+    }
+
+    pub fn applied_order(&self) -> Option<&AppliedOrder> {
+        self.spool.applied_order()
     }
 
     pub fn accept_welcome(&mut self, welcome: StreamWelcome) -> Result<(), SessionError> {
@@ -197,6 +202,7 @@ impl CoreSession {
             order_id: command.payload.order_id.clone(),
             order_update_id: command.payload.order_update_id,
             content_digest_sha256: command.payload.content_digest_sha256.clone(),
+            goal: command.payload.goal,
         });
         self.queue_command_ack(command, &decision, occurred_at, applied_order)?;
         Ok(decision)
@@ -250,6 +256,52 @@ impl CoreSession {
             report_sequence: self.spool.next_report_sequence(),
             robot_id: self.robot_id.clone(),
             payload: ReportPayload::State(payload),
+        };
+        self.spool.enqueue(report)?;
+        Ok(message_id)
+    }
+
+    pub fn queue_order_completed(
+        &mut self,
+        simulation_time_ms: i64,
+        occurred_at: String,
+    ) -> Result<Uuid, SessionError> {
+        if self.state != SessionState::Synchronized {
+            return Err(SessionError::NotSynchronized);
+        }
+        let epoch = self.session_epoch.ok_or(SessionError::NoSession)?;
+        let applied = self
+            .spool
+            .applied_order()
+            .cloned()
+            .ok_or(SessionError::NoAppliedOrder)?;
+        let mut evidence = serde_json::Map::new();
+        evidence.insert("orderId".to_owned(), applied.order_id.into());
+        evidence.insert(
+            "orderUpdateId".to_owned(),
+            serde_json::Value::from(applied.order_update_id),
+        );
+        let message_id = Uuid::new_v4();
+        let report = ReportEnvelope {
+            contract_version: crate::contracts::generated::CONTRACT_VERSION.to_owned(),
+            message_id,
+            message_type: "robot.event.report".to_owned(),
+            producer: self.producer(),
+            occurred_at,
+            correlation_id: Uuid::new_v4(),
+            request_id: Some(Uuid::new_v4()),
+            session_epoch: epoch,
+            simulator_id: self.simulator_id.clone(),
+            simulator_boot_id: self.spool.current_boot_id(),
+            report_sequence: self.spool.next_report_sequence(),
+            robot_id: self.robot_id.clone(),
+            payload: ReportPayload::RobotEvent(RobotEventPayload {
+                event_id: Uuid::new_v4(),
+                severity: EventSeverity::Info,
+                code: "ORDER_COMPLETED".to_owned(),
+                simulation_time_ms,
+                evidence,
+            }),
         };
         self.spool.enqueue(report)?;
         Ok(message_id)
@@ -430,6 +482,7 @@ pub enum SessionError {
     OldSession,
     RobotBinding,
     SnapshotMismatch,
+    NoAppliedOrder,
 }
 
 impl From<crate::protocol::ProtocolError> for SessionError {
@@ -459,6 +512,7 @@ impl fmt::Display for SessionError {
             Self::SnapshotMismatch => {
                 formatter.write_str("Core snapshot does not reconcile with local state")
             }
+            Self::NoAppliedOrder => formatter.write_str("there is no applied Order to complete"),
         }
     }
 }

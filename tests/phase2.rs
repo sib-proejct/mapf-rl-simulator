@@ -63,6 +63,7 @@ fn snapshot(
             robot_id: "robot-1".to_owned(),
             ready: false,
             map,
+            map_content: None,
             order_id: order.map(|(id, _)| id.to_owned()),
             order_update_id: order.map(|(_, update)| update),
             active_controller: controller.to_owned(),
@@ -93,6 +94,7 @@ fn command(epoch: u64, map: MapIdentity, command_id: Uuid, order_id: &str) -> Or
             plan_revision_id: None,
             phase: OrderPhase::Activate,
             map,
+            goal: None,
         },
     }
 }
@@ -285,6 +287,50 @@ fn application_checkpoint_and_ack_are_one_spool_transaction() {
         session
             .accept_order(&command(1, map, Uuid::new_v4(), "order-1"), NOW.to_owned())
             .is_err()
+    );
+    assert!(session.spool().applied_order().is_none());
+}
+
+#[test]
+fn accepted_completion_ack_clears_the_applied_order_checkpoint() {
+    let temp = TempDir::new().unwrap();
+    let map = map();
+    let mut session = session(&temp, map.clone(), Uuid::new_v4());
+    synchronize(&mut session, 1, map.clone());
+    session
+        .accept_order(&command(1, map, Uuid::new_v4(), "order-1"), NOW.to_owned())
+        .unwrap();
+    session.queue_order_completed(500, NOW.to_owned()).unwrap();
+    let completion = session.spool().pending().last().unwrap();
+    let acknowledgement = ReportAck {
+        contract_version: "1.0.0".to_owned(),
+        message_id: Uuid::new_v4(),
+        message_type: "report.ack".to_owned(),
+        producer: Producer {
+            kind: ProducerKind::Core,
+            id: "core-api".to_owned(),
+        },
+        occurred_at: NOW.to_owned(),
+        correlation_id: completion.correlation_id,
+        stream_id: "simulator:sim-1".to_owned(),
+        event_sequence: 19,
+        session_epoch: 1,
+        simulator_id: "sim-1".to_owned(),
+        payload: ReportAckPayload {
+            report_message_id: completion.message_id,
+            simulator_boot_id: completion.simulator_boot_id,
+            report_sequence: completion.report_sequence,
+            disposition: ReportDisposition::Accepted,
+            durability: ReportDurability::Durable,
+            retryable: false,
+            code: "REPORT_ACCEPTED".to_owned(),
+        },
+    };
+
+    assert!(session.spool().applied_order().is_some());
+    assert_eq!(
+        session.accept_report_ack(&acknowledgement).unwrap(),
+        AckResult::Removed
     );
     assert!(session.spool().applied_order().is_none());
 }

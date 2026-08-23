@@ -22,11 +22,11 @@
     "fixtures/valid/problem.json": "0a5ad56e4305c719bd04ef741dde346fca073b84d86af5eb79b1ce658f0576a2",
     "fixtures/valid/robot-capability.json": "2f9f722f3101a78b715ee186a578373bb69263c4d95b4225de2cdb3cee568139",
     "fixtures/valid/ws-command-ack.json": "535055e23333e4cf871362e799a4205371796c1ca682376a3514bfc4b83b5818",
-    "fixtures/valid/ws-order-command.json": "36a226a0a1275deaf8f615488903d9daa8d32d9aaddaf59df71e195ae811e058",
+    "fixtures/valid/ws-order-command.json": "9cc0f9000d945f7991544448e8315c96dbb91b8bf85728e808e7574826e8b599",
     "fixtures/valid/ws-report-ack.json": "fe9129bdb5211afa0bea14184cbff64b75dab1d5bbc6439f613eb6141613c46c",
     "fixtures/valid/ws-robot-event-report.json": "79b36468fa914d50e40c66933296283a7354983e42395d9b419ec2076f9a5be0",
     "fixtures/valid/ws-robot-state-report.json": "17d4140cbf82952479373b15ba48d807a69cb6f5950531372e63506718275991",
-    "openapi/openapi.json": "ec3afaa094fcf814a987c78308091c776185b48723211ca06f6bb53990dfbe24",
+    "openapi/openapi.json": "d8780dd1df831fb1ee2acc5c406629f371ebc91100b5bf745e0eb86f3877a25e",
     "schemas/common.schema.json": "edeb6604f1257d840a179656ca85751cae9c0fa2b47c2e37b73dfb11e81b84d3",
     "schemas/map.schema.json": "c1b47badde547629298e4cd1dca8555d7f64ab350a602359c5962b68d78367ce",
     "schemas/policy-action.schema.json": "249037c856a56a3880a6b79f1ec12dbea144030b23af434093d3288003159bd2",
@@ -37,10 +37,10 @@
     "schemas/policy-validation-vectors.schema.json": "bef97226a93e8607bd66feb53e0616c955830ff15705f15eefa4b4e935353148",
     "schemas/problem.schema.json": "1257872f991aae3cf413fe08cd3800b9ef242114433a02dc59e737eaf4c12d4e",
     "schemas/robot-capability.schema.json": "36c535c2507b824d9e6d5ba3885ce001672b58205d140a77b59a472126562746",
-    "schemas/ws.schema.json": "d582ec634fd53bbb3b3d3bc221a208fb1058bfb3ec71f4cfd3af7f82b41a34f3",
+    "schemas/ws.schema.json": "edde3f309a35cd80c463e1e94b3354a01e22f255a307683cd0a5bf6ffcc83efe",
     "vendor/vda5050/3.0.0.lock.json": "f270df03a15ab7ce892d56eee534cab126725ca6bc06cd2f51197581689e3944",
     "vendor/vda5050/ADOPTION.md": "71a20f67c8d204d6e4a5cc97491fa11679b74c21fa573a7dd0c9cec4ffcd3c27"
   },
-  "sourceRevision": "f2f7de01a276fedcd8d3598adaf9e97f82397fc3",
-  "treeDigestSha256": "c012efb7dc8ae98232b0efd70b9a495cd057ea3f33c1841543674a030dd129c0"
+  "sourceRevision": "WORKTREE",
+  "treeDigestSha256": "f4eb8afaba5528212e7f6814364c37c5add0af079144907b17f41e2966b43c60"
 }

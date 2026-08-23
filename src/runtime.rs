@@ -1,8 +1,11 @@
 //! Async Phase 2 transport/session composition.
 
 use crate::core_client::{CoreClient, CoreClientError, CoreWebSocket};
-use crate::protocol::{OrderCommand, PoseReport, ReportAck, ReportEnvelope, StreamWelcome};
+use crate::protocol::{
+    OrderCommand, PoseReport, ReportAck, ReportEnvelope, SimulatorSnapshot, StreamWelcome,
+};
 use crate::session::{CoreSession, OrderDecision, SessionError, StreamSequenceDisposition};
+use crate::spool::AppliedOrder;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -23,16 +26,21 @@ impl Phase2Runtime {
 
     /// Authenticates the WebSocket, consumes the new epoch, reconciles through
     /// authenticated REST, then replays every report still in the local spool.
-    pub async fn connect_and_replay(&mut self, monotonic_ms: u64) -> Result<(), RuntimeError> {
-        if let Err(error) = self.connect_inner().await {
-            self.websocket = None;
-            self.mark_disconnected(monotonic_ms).await?;
-            return Err(error);
+    pub async fn connect_and_replay(
+        &mut self,
+        monotonic_ms: u64,
+    ) -> Result<SimulatorSnapshot, RuntimeError> {
+        match self.connect_inner().await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                self.websocket = None;
+                self.mark_disconnected(monotonic_ms).await?;
+                Err(error)
+            }
         }
-        Ok(())
     }
 
-    async fn connect_inner(&mut self) -> Result<(), RuntimeError> {
+    async fn connect_inner(&mut self) -> Result<SimulatorSnapshot, RuntimeError> {
         let resume_after = self
             .session_call(|session| Ok(session.resume_after()))
             .await?;
@@ -43,7 +51,8 @@ impl Phase2Runtime {
             .await?;
 
         let snapshot = self.client.fetch_snapshot().await?;
-        self.session_call(move |session| Ok(session.reconcile(&snapshot)?))
+        let reconciliation_snapshot = snapshot.clone();
+        self.session_call(move |session| Ok(session.reconcile(&reconciliation_snapshot)?))
             .await?;
         let pending = self
             .session_call(|session| Ok(session.spool().pending().to_vec()))
@@ -52,7 +61,7 @@ impl Phase2Runtime {
             websocket.write_report(report).await?;
         }
         self.websocket = Some(websocket);
-        Ok(())
+        Ok(snapshot)
     }
 
     /// Queues one periodic state projection if the injected monotonic schedule is
@@ -98,6 +107,37 @@ impl Phase2Runtime {
         Ok(true)
     }
 
+    pub async fn publish_order_completed(
+        &mut self,
+        simulation_time_ms: i64,
+        occurred_at: String,
+        monotonic_ms: u64,
+    ) -> Result<(), RuntimeError> {
+        let report = self
+            .session_call(move |session| {
+                let message_id = session.queue_order_completed(simulation_time_ms, occurred_at)?;
+                session
+                    .spool()
+                    .pending()
+                    .iter()
+                    .find(|report| report.message_id == message_id)
+                    .cloned()
+                    .ok_or(RuntimeError::MissingCompletionReport)
+            })
+            .await?;
+        if let Err(error) = self.write_without_accepting(&report).await {
+            self.websocket = None;
+            self.mark_disconnected(monotonic_ms).await?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub async fn applied_order(&self) -> Result<Option<AppliedOrder>, RuntimeError> {
+        self.session_call(|session| Ok(session.applied_order().cloned()))
+            .await
+    }
+
     /// Handles one Core frame. Command application and its durable application ack
     /// happen before `OrderApplied` is returned; execution is reported only by a
     /// later periodic state report.
@@ -127,6 +167,7 @@ impl Phase2Runtime {
         match message_type {
             "order.command" => {
                 let command: OrderCommand = serde_json::from_value(value)?;
+                let event_command = command.clone();
                 let sequence = command.event_sequence;
                 let (stream, decision, acknowledgement) = self
                     .session_call(move |session| {
@@ -149,7 +190,10 @@ impl Phase2Runtime {
                     self.mark_disconnected(monotonic_ms).await?;
                     return Err(error);
                 }
-                Ok(RuntimeEvent::Order(decision))
+                Ok(RuntimeEvent::Order {
+                    decision,
+                    command: Box::new(event_command),
+                })
             }
             "report.ack" => {
                 let acknowledgement: ReportAck = serde_json::from_value(value)?;
@@ -252,7 +296,10 @@ impl Phase2Runtime {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeEvent {
-    Order(OrderDecision),
+    Order {
+        decision: OrderDecision,
+        command: Box<OrderCommand>,
+    },
     ReportAcknowledged(crate::spool::AckResult),
 }
 
@@ -264,6 +311,7 @@ pub enum RuntimeError {
     Disconnected,
     InvalidCoreMessage,
     MissingApplicationAck,
+    MissingCompletionReport,
     SessionWorkerPanicked,
     SnapshotMismatch,
     StreamGap,
@@ -298,6 +346,9 @@ impl fmt::Display for RuntimeError {
             Self::InvalidCoreMessage => formatter.write_str("Core sent an unsupported message"),
             Self::MissingApplicationAck => {
                 formatter.write_str("application ack was not durably spooled")
+            }
+            Self::MissingCompletionReport => {
+                formatter.write_str("completion report was not durably spooled")
             }
             Self::SessionWorkerPanicked => formatter.write_str("blocking session worker failed"),
             Self::SnapshotMismatch => {

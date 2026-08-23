@@ -32,6 +32,76 @@ pub struct MapIdentity {
     pub content_digest_sha256: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapCoordinateFrame {
+    pub name: String,
+    pub handedness: String,
+    pub x_axis: String,
+    pub y_axis: String,
+    pub z_axis: String,
+    pub yaw: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MapOrigin {
+    pub x_meters: f64,
+    pub y_meters: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RasterMapContent {
+    pub contract_version: String,
+    pub map_id: Uuid,
+    pub revision: u64,
+    pub content_digest_sha256: String,
+    pub coordinate_frame: MapCoordinateFrame,
+    pub origin: MapOrigin,
+    pub resolution_meters: f64,
+    pub width_cells: u32,
+    pub height_cells: u32,
+    pub cells: Vec<u8>,
+}
+
+impl RasterMapContent {
+    pub fn identity(&self) -> MapIdentity {
+        MapIdentity {
+            map_id: self.map_id,
+            revision: self.revision,
+            content_digest_sha256: self.content_digest_sha256.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.identity().validate()?;
+        if self.contract_version != CONTRACT_VERSION
+            || self.coordinate_frame.name != "map"
+            || self.coordinate_frame.handedness != "RIGHT_HANDED"
+            || self.coordinate_frame.x_axis != "EAST"
+            || self.coordinate_frame.y_axis != "NORTH"
+            || self.coordinate_frame.z_axis != "UP"
+            || self.coordinate_frame.yaw != "COUNTERCLOCKWISE_FROM_POSITIVE_X_RADIANS"
+            || !self.origin.x_meters.is_finite()
+            || !self.origin.y_meters.is_finite()
+            || !self.resolution_meters.is_finite()
+            || self.resolution_meters <= 0.0
+            || self.width_cells == 0
+            || self.height_cells == 0
+            || self.cells.iter().any(|cell| *cell > 1)
+            || usize::try_from(self.width_cells).ok().and_then(|width| {
+                usize::try_from(self.height_cells)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            }) != Some(self.cells.len())
+        {
+            return Err(ProtocolError::InvalidField("mapContent"));
+        }
+        Ok(())
+    }
+}
+
 impl MapIdentity {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         ensure_uuid_v4(self.map_id, "mapId")?;
@@ -94,6 +164,13 @@ pub enum OrderPhase {
     Abort,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrderGoal {
+    pub column: u32,
+    pub row: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrderCommandPayload {
@@ -105,6 +182,8 @@ pub struct OrderCommandPayload {
     pub plan_revision_id: Option<Uuid>,
     pub phase: OrderPhase,
     pub map: MapIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<OrderGoal>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -226,11 +305,30 @@ pub struct CommandAckPayload {
     pub code: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EventSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RobotEventPayload {
+    pub event_id: Uuid,
+    pub severity: EventSeverity,
+    pub code: String,
+    pub simulation_time_ms: i64,
+    pub evidence: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ReportPayload {
     State(RobotStatePayload),
     CommandAck(CommandAckPayload),
+    RobotEvent(RobotEventPayload),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -292,6 +390,15 @@ impl ReportEnvelope {
                 ensure_sha256(&payload.content_digest_sha256, "Order content digest")?;
                 if let Some(code) = &payload.code {
                     ensure_code(code)?;
+                }
+                Ok(())
+            }
+            ("robot.event.report", ReportPayload::RobotEvent(payload), Some(request_id)) => {
+                ensure_uuid_v4(request_id, "requestId")?;
+                ensure_uuid_v4(payload.event_id, "eventId")?;
+                ensure_code(&payload.code)?;
+                if payload.simulation_time_ms < 0 {
+                    return Err(ProtocolError::InvalidField("simulationTimeMs"));
                 }
                 Ok(())
             }
@@ -372,12 +479,14 @@ pub struct StreamCursor {
     pub event_sequence: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SimulatorRobotSnapshot {
     pub robot_id: String,
     pub ready: bool,
     pub map: MapIdentity,
+    #[serde(default)]
+    pub map_content: Option<RasterMapContent>,
     #[serde(default)]
     pub order_id: Option<String>,
     #[serde(default)]
@@ -385,7 +494,7 @@ pub struct SimulatorRobotSnapshot {
     pub active_controller: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SimulatorSnapshot {
     pub contract_version: String,
@@ -409,6 +518,12 @@ impl SimulatorSnapshot {
             ensure_id(&robot.robot_id, 128, "robotId")?;
             ensure_id(&robot.active_controller, 128, "activeController")?;
             robot.map.validate()?;
+            if let Some(content) = &robot.map_content {
+                content.validate()?;
+                if content.identity() != robot.map {
+                    return Err(ProtocolError::InvalidField("mapContent identity"));
+                }
+            }
             if robot.order_id.is_some() != robot.order_update_id.is_some() {
                 return Err(ProtocolError::InvalidField("snapshot Order identity"));
             }

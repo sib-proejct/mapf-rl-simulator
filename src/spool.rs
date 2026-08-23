@@ -3,7 +3,9 @@
 //! Filesystem methods are synchronous by design and must be called from startup or
 //! a Tokio blocking boundary, never while occupying an async network task.
 
-use crate::protocol::{ReportAckPayload, ReportDisposition, ReportEnvelope, ReportPayload};
+use crate::protocol::{
+    OrderGoal, ReportAckPayload, ReportDisposition, ReportEnvelope, ReportPayload,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -21,6 +23,8 @@ pub struct AppliedOrder {
     pub order_id: String,
     pub order_update_id: u64,
     pub content_digest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<OrderGoal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -224,6 +228,11 @@ impl DurableSpool {
             return Ok(AckResult::Retained);
         }
 
+        let clears_applied_order = disposition != ReportDisposition::Rejected
+            && completion_matches_applied_order(
+                &self.body.pending[index],
+                self.body.applied_order.as_ref(),
+            );
         let previous = self.body.clone();
         let report = self.body.pending.remove(index);
         let result = if disposition == ReportDisposition::Rejected {
@@ -233,6 +242,9 @@ impl DurableSpool {
             });
             AckResult::DeadLettered
         } else {
+            if clears_applied_order {
+                self.body.applied_order = None;
+            }
             AckResult::Removed
         };
         self.persist_or_rollback(previous)?;
@@ -275,6 +287,29 @@ impl DurableSpool {
         File::open(parent)?.sync_all()?;
         Ok(())
     }
+}
+
+fn completion_matches_applied_order(
+    report: &ReportEnvelope,
+    applied: Option<&AppliedOrder>,
+) -> bool {
+    let Some(applied) = applied else {
+        return false;
+    };
+    let ReportPayload::RobotEvent(payload) = &report.payload else {
+        return false;
+    };
+    payload.code == "ORDER_COMPLETED"
+        && payload
+            .evidence
+            .get("orderId")
+            .and_then(serde_json::Value::as_str)
+            == Some(applied.order_id.as_str())
+        && payload
+            .evidence
+            .get("orderUpdateId")
+            .and_then(serde_json::Value::as_u64)
+            == Some(applied.order_update_id)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

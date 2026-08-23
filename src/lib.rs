@@ -10,6 +10,7 @@ pub mod controller;
 pub mod core_client;
 pub mod fault;
 pub mod motion;
+pub mod operational;
 pub mod protocol;
 pub mod random;
 pub mod runtime;
