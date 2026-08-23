@@ -171,6 +171,52 @@ pub struct OrderGoal {
     pub row: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrderRouteWaypoint {
+    pub column: u32,
+    pub row: u32,
+    pub start_simulation_time_ms: u64,
+    pub end_simulation_time_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrderRoute {
+    pub robot_id: String,
+    pub order_id: String,
+    pub release_after_robot_id: Option<String>,
+    pub plan_digest_sha256: String,
+    pub waypoints: Vec<OrderRouteWaypoint>,
+}
+
+impl OrderRoute {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        ensure_id(&self.robot_id, 128, "route robotId")?;
+        ensure_id(&self.order_id, 128, "route orderId")?;
+        if let Some(robot_id) = &self.release_after_robot_id {
+            ensure_id(robot_id, 128, "route releaseAfterRobotId")?;
+        }
+        ensure_sha256(&self.plan_digest_sha256, "route plan digest")?;
+        if self.waypoints.is_empty()
+            || self.waypoints.iter().any(|waypoint| {
+                waypoint.end_simulation_time_ms <= waypoint.start_simulation_time_ms
+            })
+        {
+            return Err(ProtocolError::InvalidField("route waypoints"));
+        }
+        for pair in self.waypoints.windows(2) {
+            let previous = pair[0];
+            let next = pair[1];
+            let distance = previous.column.abs_diff(next.column) + previous.row.abs_diff(next.row);
+            if distance != 1 || previous.end_simulation_time_ms != next.start_simulation_time_ms {
+                return Err(ProtocolError::InvalidField("route continuity"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrderCommandPayload {
@@ -184,6 +230,8 @@ pub struct OrderCommandPayload {
     pub map: MapIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<OrderGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<OrderRoute>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -223,6 +271,12 @@ impl OrderCommand {
         ensure_sha256(&self.payload.content_digest_sha256, "Order content digest")?;
         if let Some(plan_revision_id) = self.payload.plan_revision_id {
             ensure_uuid_v4(plan_revision_id, "planRevisionId")?;
+        }
+        if let Some(route) = &self.payload.route {
+            route.validate()?;
+            if route.robot_id != self.robot_id || route.order_id != self.payload.order_id {
+                return Err(ProtocolError::InvalidField("route binding"));
+            }
         }
         self.payload.map.validate()
     }

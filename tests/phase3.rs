@@ -9,19 +9,22 @@ use mapf_rl_simulator::plan::{
 };
 use mapf_rl_simulator::protocol::{
     ActiveController, CommandDisposition, ControllerMode, EventSeverity, MapIdentity, OrderCommand,
-    OrderCommandPayload, OrderPhase, PoseReport, Producer, ProducerKind, ReportEnvelope,
-    ReportPayload, RobotEventPayload, RobotStatePayload, SimulatorRobotSnapshot, SimulatorSnapshot,
-    StreamCursor, StreamWelcome, StreamWelcomePayload,
+    OrderCommandPayload, OrderGoal, OrderPhase, OrderRoute, OrderRouteWaypoint, PoseReport,
+    Producer, ProducerKind, ReportEnvelope, ReportPayload, RobotEventPayload, RobotStatePayload,
+    SimulatorRobotSnapshot, SimulatorSnapshot, StreamCursor, StreamWelcome, StreamWelcomePayload,
 };
 use mapf_rl_simulator::report_queue::{
     BoundedReportQueue, EnqueueOutcome, ReportClass, ReportQueueError,
 };
+use mapf_rl_simulator::route::action_for_route;
 use mapf_rl_simulator::safety::SafetyConfig;
 use mapf_rl_simulator::sensing::SensorConfig;
 use mapf_rl_simulator::session::{CoreSession, SessionState};
 use mapf_rl_simulator::simulation::{EngineConfig, ManualMonotonicClock, SimulationEngine};
 use mapf_rl_simulator::spool::{AppliedOrder, DurableSpool};
-use mapf_rl_simulator::types::{Acceleration, RobotId, RobotState, Velocity, WorldPosition};
+use mapf_rl_simulator::types::{
+    Acceleration, RobotId, RobotState, SimulationTimeMs, Velocity, WorldPosition,
+};
 use mapf_rl_simulator::world::{GridCell, GridMap};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -131,6 +134,8 @@ fn core_prepare_ack_and_activation_checkpoint_are_separate_and_timeout_is_fail_c
 
     command.payload.phase = OrderPhase::Activate;
     command.payload.command_id = Uuid::new_v4();
+    command.payload.goal = None;
+    command.payload.route = None;
     let activated = session
         .accept_order_at(&command, NOW.to_owned(), 101, true)
         .unwrap();
@@ -141,6 +146,25 @@ fn core_prepare_ack_and_activation_checkpoint_are_separate_and_timeout_is_fail_c
         session.applied_order().unwrap().plan_revision_id,
         Some(plan_revision_id)
     );
+    assert_eq!(
+        session
+            .applied_order()
+            .unwrap()
+            .route
+            .as_ref()
+            .unwrap()
+            .waypoints
+            .len(),
+        2
+    );
+
+    command.payload.phase = OrderPhase::Abort;
+    command.payload.command_id = Uuid::new_v4();
+    let aborted = session
+        .accept_order_at(&command, NOW.to_owned(), 102, true)
+        .unwrap();
+    assert_eq!(aborted.code, "PLAN_ABORTED");
+    assert!(session.applied_order().is_none());
 
     let timeout_temp = TempDir::new().unwrap();
     let map = command.payload.map.clone();
@@ -165,6 +189,46 @@ fn core_prepare_ack_and_activation_checkpoint_are_separate_and_timeout_is_fail_c
     );
     assert_eq!(timeout_session.state(), SessionState::Degraded);
     assert!(timeout_session.prepared_order().is_none());
+}
+
+#[test]
+fn prepared_route_follower_waits_for_timestamp_then_moves_to_next_waypoint() {
+    let map = GridMap::new(3, 1, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, []).unwrap();
+    let route = OrderRoute {
+        robot_id: "r1".to_owned(),
+        order_id: "order-r1".to_owned(),
+        release_after_robot_id: None,
+        plan_digest_sha256: "f".repeat(64),
+        waypoints: vec![
+            OrderRouteWaypoint {
+                column: 0,
+                row: 0,
+                start_simulation_time_ms: 0,
+                end_simulation_time_ms: 1_000,
+            },
+            OrderRouteWaypoint {
+                column: 1,
+                row: 0,
+                start_simulation_time_ms: 1_000,
+                end_simulation_time_ms: 2_000,
+            },
+        ],
+    };
+    let position = map.grid_to_world(GridCell::new(0, 0)).unwrap();
+    assert_eq!(
+        action_for_route(&map, position, SimulationTimeMs::ZERO, &route).unwrap(),
+        0
+    );
+    assert_eq!(
+        action_for_route(
+            &map,
+            position,
+            SimulationTimeMs::new(1_000).unwrap(),
+            &route,
+        )
+        .unwrap(),
+        2
+    );
 }
 
 fn synchronized_session(temp: &TempDir, map: MapIdentity) -> CoreSession {
@@ -223,6 +287,26 @@ fn synchronized_session(temp: &TempDir, map: MapIdentity) -> CoreSession {
 }
 
 fn plan_command(map: MapIdentity, plan_revision_id: Uuid, phase: OrderPhase) -> OrderCommand {
+    let route = OrderRoute {
+        robot_id: "r1".to_owned(),
+        order_id: "order-r1".to_owned(),
+        release_after_robot_id: None,
+        plan_digest_sha256: "f".repeat(64),
+        waypoints: vec![
+            OrderRouteWaypoint {
+                column: 0,
+                row: 0,
+                start_simulation_time_ms: 0,
+                end_simulation_time_ms: 1_000,
+            },
+            OrderRouteWaypoint {
+                column: 1,
+                row: 0,
+                start_simulation_time_ms: 1_000,
+                end_simulation_time_ms: 2_000,
+            },
+        ],
+    };
     OrderCommand {
         contract_version: "1.0.0".to_owned(),
         message_id: Uuid::new_v4(),
@@ -240,12 +324,13 @@ fn plan_command(map: MapIdentity, plan_revision_id: Uuid, phase: OrderPhase) -> 
         payload: OrderCommandPayload {
             command_id: Uuid::new_v4(),
             order_id: "order-r1".to_owned(),
-            order_update_id: 0,
+            order_update_id: 1,
             content_digest_sha256: "e".repeat(64),
             plan_revision_id: Some(plan_revision_id),
             phase,
             map,
-            goal: None,
+            goal: Some(OrderGoal { column: 1, row: 0 }),
+            route: Some(route),
         },
     }
 }
@@ -584,6 +669,7 @@ fn restart_does_not_reuse_a_spooled_plan_activation_as_motion_authority() {
                     content_digest_sha256: "c".repeat(64),
                     plan_revision_id: Some(plan_revision_id),
                     goal: None,
+                    route: None,
                 }),
             )
             .unwrap();

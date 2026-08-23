@@ -95,6 +95,7 @@ fn command(epoch: u64, map: MapIdentity, command_id: Uuid, order_id: &str) -> Or
             phase: OrderPhase::Activate,
             map,
             goal: None,
+            route: None,
         },
     }
 }

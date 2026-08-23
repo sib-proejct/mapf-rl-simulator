@@ -17,6 +17,7 @@ pub mod plan;
 pub mod protocol;
 pub mod random;
 pub mod report_queue;
+pub mod route;
 pub mod runtime;
 pub mod safety;
 pub mod scenario;

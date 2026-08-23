@@ -1,10 +1,17 @@
-//! Production composition of Core transport, durable session state, and the Phase 1 engine.
+//! Production composition of Core transport, durable plan state, and fleet safety.
 
+use crate::checkpoint::CheckpointStore;
 use crate::controller::{BaselineController, RuntimeProfile};
 use crate::core_client::{ApiKey, CoreClient, CoreClientConfig};
+use crate::fleet::{FleetConfig, MultiRobotEngine, RecoveryReason};
 use crate::motion::MotionLimits;
-use crate::protocol::{MapIdentity, OrderGoal, PoseReport, RasterMapContent};
-use crate::runtime::{Phase2Runtime, RuntimeEvent};
+use crate::plan::{PlanCoordinator, PlanRevision, PlanTarget};
+use crate::protocol::{
+    CommandDisposition, EventSeverity, MapIdentity, OrderCommand, OrderGoal, OrderPhase,
+    PoseReport, RasterMapContent,
+};
+use crate::route::action_for_route;
+use crate::runtime::{IncidentReport, Phase2Runtime, RuntimeEvent};
 use crate::safety::SafetyConfig;
 use crate::sensing::SensorConfig;
 use crate::session::CoreSession;
@@ -12,6 +19,8 @@ use crate::simulation::{EngineConfig, ManualMonotonicClock, SimulationEngine};
 use crate::spool::DurableSpool;
 use crate::types::{Acceleration, RobotId, RobotState, Velocity, WorldPosition};
 use crate::world::{GridCell, GridMap};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::io;
@@ -28,6 +37,7 @@ struct OperationalConfig {
     websocket_url: Url,
     api_key: ApiKey,
     spool_path: PathBuf,
+    checkpoint_path: PathBuf,
     map: MapIdentity,
     start: GridCell,
     master_seed: u64,
@@ -43,6 +53,9 @@ impl OperationalConfig {
         let websocket_url = Url::parse(&required("MAPF_SIMULATOR_CORE_WS_URL")?)?;
         let api_key = ApiKey::new(&required("MAPF_SIMULATOR_API_KEY")?)?;
         let spool_path = PathBuf::from(required("MAPF_SIMULATOR_SPOOL_PATH")?);
+        let checkpoint_path = env::var("MAPF_SIMULATOR_CHECKPOINT_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| spool_path.with_extension("safety.json"));
         let map = MapIdentity {
             map_id: Uuid::parse_str(&required("MAPF_SIMULATOR_MAP_ID")?)?,
             revision: parse("MAPF_SIMULATOR_MAP_REVISION")?,
@@ -57,6 +70,7 @@ impl OperationalConfig {
             websocket_url,
             api_key,
             spool_path,
+            checkpoint_path,
             map,
             start: GridCell::new(
                 parse_or("MAPF_SIMULATOR_START_COLUMN", 0)?,
@@ -103,9 +117,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     if map.is_blocked(config.start)? {
         return Err(invalid("configured start cell is blocked").into());
     }
-    let mut engine = SimulationEngine::new(
+    let engine = SimulationEngine::new(
         ManualMonotonicClock::default(),
-        RobotId::new(config.robot_id)?,
+        RobotId::new(config.robot_id.clone())?,
         map,
         RobotState::new(initial_position, Velocity::ZERO, Acceleration::ZERO, 0.0)?,
         EngineConfig {
@@ -116,7 +130,19 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         config.master_seed,
         &[],
     )?;
+    let robot_id = RobotId::new(config.robot_id.clone())?;
+    let mut fleet = MultiRobotEngine::new([engine], FleetConfig::new(0.5, 50)?)?;
+    let checkpoint_store = CheckpointStore::new(&config.checkpoint_path)?;
+    let mut plans = PlanCoordinator::new();
+    let mut restart_plan_revision_id = None;
+    if let Some(checkpoint) = checkpoint_store
+        .load_for_restart(&config.simulator_id, &config.map.content_digest_sha256)?
+    {
+        plans = fleet.restore_checkpoint(&checkpoint)?;
+        restart_plan_revision_id = plans.active_revision_id();
+    }
     let mut completion_queued = false;
+    let mut recovery_reported = false;
     let mut interval = tokio::time::interval(Duration::from_millis(100));
 
     loop {
@@ -125,15 +151,92 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             _ = interval.tick() => {
                 let applied = runtime.applied_order().await?;
                 let preparing = runtime.prepared_order().await?.is_some();
+                let engine = &fleet.robots()[&robot_id];
+                let mut route_deviation = false;
                 let action = if preparing {
                     0
+                } else if let Some(order) = &applied {
+                    if let Some(route) = &order.route {
+                        match action_for_route(
+                            engine.map(),
+                            engine.state().position(),
+                            engine.simulation_time(),
+                            route,
+                        ) {
+                            Ok(action) => action,
+                            Err(_) => {
+                                route_deviation = true;
+                                0
+                            }
+                        }
+                    } else {
+                        order.goal.map_or(0, |goal| action_toward_goal(engine, goal))
+                    }
                 } else {
-                    applied
-                        .as_ref()
-                        .and_then(|order| order.goal)
-                        .map_or(0, |goal| action_toward_goal(&engine, goal))
+                    0
                 };
-                let record = engine.step(action)?;
+                let step = fleet.step(
+                    &BTreeMap::from([(robot_id.clone(), action)]),
+                    &mut plans,
+                )?;
+                let record = step.records.get(&robot_id).ok_or_else(|| {
+                    invalid("fleet step omitted the configured robot")
+                })?;
+                if let Some(plan_revision_id) = applied
+                    .as_ref()
+                    .and_then(|order| order.plan_revision_id)
+                    && plans.motion_authorized(&config.robot_id)
+                {
+                    plans.confirm_runtime_safe(plan_revision_id, &config.robot_id)?;
+                }
+                let engine = &fleet.robots()[&robot_id];
+                if route_deviation && !recovery_reported {
+                    plans.hold_for_recovery(None)?;
+                }
+                if !recovery_reported
+                    && (route_deviation || step.recovery.is_some())
+                {
+                    let (code, held_robots) = if route_deviation {
+                        ("SAFETY_ROUTE_DEVIATION", vec![config.robot_id.clone()])
+                    } else {
+                        let recovery = step.recovery.as_ref().expect("checked recovery");
+                        let code = match recovery.reason {
+                            RecoveryReason::Collision => "COLLISION_RISK",
+                            RecoveryReason::CorridorConflict => "CORRIDOR_CONFLICT",
+                            RecoveryReason::Deadlock => "DEADLOCK_DETECTED",
+                            RecoveryReason::RobotFailure => "ROBOT_FAILURE",
+                        };
+                        (code, recovery.held_robots.clone())
+                    };
+                    let mut evidence = serde_json::Map::new();
+                    evidence.insert("heldRobots".to_owned(), serde_json::json!(held_robots));
+                    if let Some(order) = &applied {
+                        evidence.insert("orderId".to_owned(), order.order_id.clone().into());
+                        evidence.insert(
+                            "orderUpdateId".to_owned(),
+                            serde_json::Value::from(order.order_update_id),
+                        );
+                    }
+                    runtime
+                        .publish_incident(
+                            IncidentReport {
+                                event_id: Uuid::new_v4(),
+                                severity: EventSeverity::Critical,
+                                code: code.to_owned(),
+                                simulation_time_ms: engine.simulation_time().get(),
+                                evidence,
+                                occurred_at: utc_now_milliseconds()?,
+                            },
+                            monotonic_ms,
+                        )
+                        .await?;
+                    recovery_reported = true;
+                }
+                save_checkpoint(&checkpoint_store, fleet.checkpoint(
+                    config.simulator_id.clone(),
+                    config.map.content_digest_sha256.clone(),
+                    plans.clone(),
+                )).await?;
                 let occurred_at = utc_now_milliseconds()?;
                 runtime.publish_state_if_due(
                     monotonic_ms,
@@ -146,9 +249,37 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                     },
                     occurred_at,
                 ).await?;
+                if let Some(plan_revision_id) = restart_plan_revision_id {
+                    let mut evidence = serde_json::Map::new();
+                    evidence.insert(
+                        "planRevisionId".to_owned(),
+                        plan_revision_id.to_string().into(),
+                    );
+                    runtime
+                        .publish_incident(
+                            IncidentReport {
+                                event_id: stable_restart_event_id(plan_revision_id),
+                                severity: EventSeverity::Critical,
+                                code: "SAFETY_RESTART_RECONCILIATION_REQUIRED".to_owned(),
+                                simulation_time_ms: engine.simulation_time().get(),
+                                evidence,
+                                occurred_at: utc_now_milliseconds()?,
+                            },
+                            monotonic_ms,
+                        )
+                        .await?;
+                    restart_plan_revision_id = None;
+                }
                 if !completion_queued
-                    && applied.as_ref().and_then(|order| order.goal).is_some_and(|goal| {
-                        goal_reached_and_stopped(&engine, goal)
+                    && applied.as_ref().is_some_and(|order| {
+                        order.goal.is_some_and(|goal| goal_reached_and_stopped(engine, goal))
+                            && order.route.as_ref().is_none_or(|route| {
+                                route.waypoints.last().is_some_and(|waypoint| {
+                                    engine.simulation_time().get()
+                                        >= i64::try_from(waypoint.start_simulation_time_ms)
+                                            .unwrap_or(i64::MAX)
+                                })
+                            })
                     })
                 {
                     runtime.publish_order_completed(
@@ -162,21 +293,91 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             event = runtime.receive_one_with_motion(
                 monotonic_ms,
                 utc_now_milliseconds()?,
-                engine.state().velocity().magnitude() < 1.0e-6
-                    && engine.state().acceleration().magnitude() < 1.0e-6,
+                fleet.robots()[&robot_id].state().velocity().magnitude() < 1.0e-6
+                    && fleet.robots()[&robot_id].state().acceleration().magnitude() < 1.0e-6,
             ) => {
                 match event? {
                     RuntimeEvent::Order { decision, command } => {
-                        if decision.apply_to_robot {
-                            let goal = command.payload.goal.ok_or_else(|| {
-                                invalid("Core Order command omits its goal")
+                        if command.payload.phase == OrderPhase::Prepare
+                            && decision.disposition == CommandDisposition::Prepared
+                        {
+                            let revision = local_revision(&command)?;
+                            plans.begin_prepare(revision.clone(), monotonic_ms)?;
+                            plans.mark_safe_hold(
+                                revision.plan_revision_id,
+                                &config.robot_id,
+                                true,
+                                monotonic_ms,
+                            )?;
+                        } else if command.payload.phase == OrderPhase::Abort {
+                            if let Some(plan_revision_id) = command.payload.plan_revision_id
+                                && plans.active_revision_id() == Some(plan_revision_id)
+                            {
+                                plans.abort(plan_revision_id)?;
+                            }
+                        } else if decision.apply_to_robot {
+                            let applied = runtime.applied_order().await?.ok_or_else(|| {
+                                invalid("applied Order checkpoint is missing")
                             })?;
-                            validate_goal(engine.map(), goal)?;
+                            let goal = applied.goal.ok_or_else(|| {
+                                invalid("prepared Order omits its goal")
+                            })?;
+                            validate_goal(fleet.robots()[&robot_id].map(), goal)?;
+                            if let Some(plan_revision_id) = applied.plan_revision_id {
+                                plans.activate(
+                                    plan_revision_id,
+                                    &PlanTarget {
+                                        robot_id: config.robot_id.clone(),
+                                        order_id: applied.order_id,
+                                        order_update_id: applied.order_update_id,
+                                        content_digest_sha256: applied.content_digest_sha256,
+                                    },
+                                    monotonic_ms,
+                                )?;
+                            } else {
+                                let revision = PlanRevision {
+                                    plan_revision_id: command.payload.command_id,
+                                    planning_snapshot_digest_sha256: applied
+                                        .content_digest_sha256
+                                        .clone(),
+                                    targets: vec![PlanTarget {
+                                        robot_id: config.robot_id.clone(),
+                                        order_id: applied.order_id,
+                                        order_update_id: applied.order_update_id,
+                                        content_digest_sha256: applied.content_digest_sha256,
+                                    }],
+                                    activation_order: vec![config.robot_id.clone()],
+                                };
+                                plans.begin_prepare(revision.clone(), monotonic_ms)?;
+                                plans.mark_safe_hold(
+                                    revision.plan_revision_id,
+                                    &config.robot_id,
+                                    true,
+                                    monotonic_ms,
+                                )?;
+                                plans.activate(
+                                    revision.plan_revision_id,
+                                    &revision.targets[0],
+                                    monotonic_ms,
+                                )?;
+                            }
                             completion_queued = false;
+                            recovery_reported = false;
                         }
+                        save_checkpoint(&checkpoint_store, fleet.checkpoint(
+                            config.simulator_id.clone(),
+                            config.map.content_digest_sha256.clone(),
+                            plans.clone(),
+                        )).await?;
                     }
                     RuntimeEvent::ReportAcknowledged(_) => {
                         if completion_queued && runtime.applied_order().await?.is_none() {
+                            plans = PlanCoordinator::new();
+                            save_checkpoint(&checkpoint_store, fleet.checkpoint(
+                                config.simulator_id.clone(),
+                                config.map.content_digest_sha256.clone(),
+                                plans.clone(),
+                            )).await?;
                             if config.exit_after_completion {
                                 return Ok(());
                             }
@@ -187,6 +388,52 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+}
+
+fn local_revision(command: &OrderCommand) -> Result<PlanRevision, Box<dyn Error>> {
+    let plan_revision_id = command
+        .payload
+        .plan_revision_id
+        .ok_or_else(|| invalid("PREPARE omits planRevisionId"))?;
+    let route = command
+        .payload
+        .route
+        .as_ref()
+        .ok_or_else(|| invalid("PREPARE omits its time-indexed route"))?;
+    let target = PlanTarget {
+        robot_id: command.robot_id.clone(),
+        order_id: command.payload.order_id.clone(),
+        order_update_id: command.payload.order_update_id,
+        content_digest_sha256: command.payload.content_digest_sha256.clone(),
+    };
+    Ok(PlanRevision {
+        plan_revision_id,
+        planning_snapshot_digest_sha256: route.plan_digest_sha256.clone(),
+        targets: vec![target],
+        activation_order: vec![command.robot_id.clone()],
+    })
+}
+
+fn stable_restart_event_id(plan_revision_id: Uuid) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(plan_revision_id.as_bytes());
+    hasher.update(b"wave3-restart-reconciliation");
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+async fn save_checkpoint(
+    store: &CheckpointStore,
+    checkpoint: crate::checkpoint::RecoveryCheckpoint,
+) -> Result<(), crate::checkpoint::CheckpointError> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || store.save(&checkpoint))
+        .await
+        .map_err(|_| crate::checkpoint::CheckpointError::Corrupt)?
 }
 
 fn build_map(content: &RasterMapContent) -> Result<GridMap, Box<dyn Error>> {
@@ -334,5 +581,13 @@ mod tests {
     fn unix_epoch_conversion_uses_utc_calendar() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_688), (2026, 8, 23));
+    }
+
+    #[test]
+    fn restart_incident_identity_is_stable_uuid_v4() {
+        let revision = Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
+        let identity = stable_restart_event_id(revision);
+        assert_eq!(identity, stable_restart_event_id(revision));
+        assert_eq!(identity.get_version_num(), 4);
     }
 }

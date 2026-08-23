@@ -4,7 +4,7 @@
 //! a Tokio blocking boundary, never while occupying an async network task.
 
 use crate::protocol::{
-    OrderGoal, ReportAckPayload, ReportDisposition, ReportEnvelope, ReportPayload,
+    OrderGoal, OrderRoute, ReportAckPayload, ReportDisposition, ReportEnvelope, ReportPayload,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,6 +27,8 @@ pub struct AppliedOrder {
     pub plan_revision_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<OrderGoal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<OrderRoute>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -40,6 +42,10 @@ pub struct PreparedOrder {
     pub prepared_at_monotonic_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<OrderGoal>,
+    // Version 1 spool files written before Wave 3 did not contain a route.
+    // They must remain readable so startup can fence and clear stale PREPARE state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<OrderRoute>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -192,7 +198,13 @@ impl DurableSpool {
         report: ReportEnvelope,
         applied_order: Option<AppliedOrder>,
     ) -> Result<(), SpoolError> {
-        self.enqueue_with_command_checkpoint(report, applied_order, PreparedOrderUpdate::Keep)
+        self.enqueue_with_command_checkpoint(
+            report,
+            applied_order.map_or(AppliedOrderUpdate::Keep, |order| {
+                AppliedOrderUpdate::Set(Box::new(order))
+            }),
+            PreparedOrderUpdate::Keep,
+        )
     }
 
     pub(crate) fn enqueue_with_prepared_order(
@@ -200,7 +212,11 @@ impl DurableSpool {
         report: ReportEnvelope,
         prepared_order: PreparedOrder,
     ) -> Result<(), SpoolError> {
-        self.enqueue_with_command_checkpoint(report, None, PreparedOrderUpdate::Set(prepared_order))
+        self.enqueue_with_command_checkpoint(
+            report,
+            AppliedOrderUpdate::Keep,
+            PreparedOrderUpdate::Set(Box::new(prepared_order)),
+        )
     }
 
     pub(crate) fn enqueue_activating_prepared_order(
@@ -210,7 +226,7 @@ impl DurableSpool {
     ) -> Result<(), SpoolError> {
         self.enqueue_with_command_checkpoint(
             report,
-            Some(applied_order),
+            AppliedOrderUpdate::Set(Box::new(applied_order)),
             PreparedOrderUpdate::Clear,
         )
     }
@@ -219,13 +235,17 @@ impl DurableSpool {
         &mut self,
         report: ReportEnvelope,
     ) -> Result<(), SpoolError> {
-        self.enqueue_with_command_checkpoint(report, None, PreparedOrderUpdate::Clear)
+        self.enqueue_with_command_checkpoint(
+            report,
+            AppliedOrderUpdate::Clear,
+            PreparedOrderUpdate::Clear,
+        )
     }
 
     fn enqueue_with_command_checkpoint(
         &mut self,
         report: ReportEnvelope,
-        applied_order: Option<AppliedOrder>,
+        applied_order: AppliedOrderUpdate,
         prepared_order: PreparedOrderUpdate,
     ) -> Result<(), SpoolError> {
         report.validate().map_err(|_| SpoolError::InvalidReport)?;
@@ -245,12 +265,14 @@ impl DurableSpool {
             .checked_add(1)
             .ok_or(SpoolError::SequenceExhausted)?;
         self.body.pending.push(report);
-        if let Some(order) = applied_order {
-            self.body.applied_order = Some(order);
+        match applied_order {
+            AppliedOrderUpdate::Keep => {}
+            AppliedOrderUpdate::Set(order) => self.body.applied_order = Some(*order),
+            AppliedOrderUpdate::Clear => self.body.applied_order = None,
         }
         match prepared_order {
             PreparedOrderUpdate::Keep => {}
-            PreparedOrderUpdate::Set(order) => self.body.prepared_order = Some(order),
+            PreparedOrderUpdate::Set(order) => self.body.prepared_order = Some(*order),
             PreparedOrderUpdate::Clear => self.body.prepared_order = None,
         }
         self.persist_or_rollback(previous)
@@ -417,7 +439,13 @@ fn completion_matches_applied_order(
 
 enum PreparedOrderUpdate {
     Keep,
-    Set(PreparedOrder),
+    Set(Box<PreparedOrder>),
+    Clear,
+}
+
+enum AppliedOrderUpdate {
+    Keep,
+    Set(Box<AppliedOrder>),
     Clear,
 }
 

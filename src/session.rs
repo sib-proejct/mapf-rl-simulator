@@ -216,13 +216,36 @@ impl CoreSession {
             self.state = SessionState::Degraded;
         }
         let decision = self.classify_order(command, stationary);
-        let applied_order = decision.apply_to_robot.then(|| AppliedOrder {
-            command_id: command.payload.command_id,
-            order_id: command.payload.order_id.clone(),
-            order_update_id: command.payload.order_update_id,
-            content_digest_sha256: command.payload.content_digest_sha256.clone(),
-            plan_revision_id: command.payload.plan_revision_id,
-            goal: command.payload.goal,
+        let applied_order = decision.apply_to_robot.then(|| {
+            if command.payload.phase == OrderPhase::Activate
+                && command.payload.plan_revision_id.is_some()
+            {
+                let prepared = self.spool.prepared_order().expect("classified activation");
+                AppliedOrder {
+                    command_id: command.payload.command_id,
+                    order_id: prepared.order_id.clone(),
+                    order_update_id: prepared.order_update_id,
+                    content_digest_sha256: prepared.content_digest_sha256.clone(),
+                    plan_revision_id: Some(prepared.plan_revision_id),
+                    goal: prepared.goal,
+                    route: Some(
+                        prepared
+                            .route
+                            .clone()
+                            .expect("classified activation has a prepared route"),
+                    ),
+                }
+            } else {
+                AppliedOrder {
+                    command_id: command.payload.command_id,
+                    order_id: command.payload.order_id.clone(),
+                    order_update_id: command.payload.order_update_id,
+                    content_digest_sha256: command.payload.content_digest_sha256.clone(),
+                    plan_revision_id: command.payload.plan_revision_id,
+                    goal: command.payload.goal,
+                    route: command.payload.route.clone(),
+                }
+            }
         });
         let prepared_order = (command.payload.phase == OrderPhase::Prepare
             && decision.disposition == CommandDisposition::Prepared)
@@ -237,6 +260,7 @@ impl CoreSession {
                     .expect("classified prepare"),
                 prepared_at_monotonic_ms: monotonic_ms,
                 goal: command.payload.goal,
+                route: command.payload.route.clone(),
             });
         self.queue_command_ack(
             command,
@@ -355,6 +379,45 @@ impl CoreSession {
         Ok(message_id)
     }
 
+    pub fn queue_incident(
+        &mut self,
+        event_id: Uuid,
+        severity: EventSeverity,
+        code: String,
+        simulation_time_ms: i64,
+        evidence: serde_json::Map<String, serde_json::Value>,
+        occurred_at: String,
+    ) -> Result<Uuid, SessionError> {
+        if self.state != SessionState::Synchronized {
+            return Err(SessionError::NotSynchronized);
+        }
+        let epoch = self.session_epoch.ok_or(SessionError::NoSession)?;
+        let message_id = Uuid::new_v4();
+        let report = ReportEnvelope {
+            contract_version: crate::contracts::generated::CONTRACT_VERSION.to_owned(),
+            message_id,
+            message_type: "robot.event.report".to_owned(),
+            producer: self.producer(),
+            occurred_at,
+            correlation_id: event_id,
+            request_id: Some(event_id),
+            session_epoch: epoch,
+            simulator_id: self.simulator_id.clone(),
+            simulator_boot_id: self.spool.current_boot_id(),
+            report_sequence: self.spool.next_report_sequence(),
+            robot_id: self.robot_id.clone(),
+            payload: ReportPayload::RobotEvent(RobotEventPayload {
+                event_id,
+                severity,
+                code,
+                simulation_time_ms,
+                evidence,
+            }),
+        };
+        self.spool.enqueue(report)?;
+        Ok(message_id)
+    }
+
     pub fn accept_report_ack(
         &mut self,
         acknowledgement: &ReportAck,
@@ -449,6 +512,17 @@ impl CoreSession {
         if !stationary {
             return rejected("PLAN_SAFE_HOLD_INCOMPLETE");
         }
+        let Some(route) = &command.payload.route else {
+            return rejected("PLAN_ROUTE_REQUIRED");
+        };
+        if command.payload.goal.is_none_or(|goal| {
+            route
+                .waypoints
+                .last()
+                .is_none_or(|waypoint| waypoint.column != goal.column || waypoint.row != goal.row)
+        }) {
+            return rejected("PLAN_GOAL_ROUTE_MISMATCH");
+        }
         if let Some(prepared) = self.spool.prepared_order() {
             return if prepared_matches_command(prepared, command) {
                 OrderDecision {
@@ -460,7 +534,15 @@ impl CoreSession {
                 rejected("PLAN_PREPARE_CONFLICT")
             };
         }
-        let sequence = self.classify_update(command);
+        let sequence = if self.spool.applied_order().is_none() {
+            OrderDecision {
+                apply_to_robot: true,
+                disposition: CommandDisposition::Applied,
+                code: "COMMAND_APPLIED",
+            }
+        } else {
+            self.classify_update(command)
+        };
         if sequence.apply_to_robot {
             OrderDecision {
                 apply_to_robot: false,
@@ -473,15 +555,24 @@ impl CoreSession {
     }
 
     fn classify_abort(&self, command: &OrderCommand) -> OrderDecision {
-        let Some(prepared) = self.spool.prepared_order() else {
+        if let Some(prepared) = self.spool.prepared_order() {
+            if !prepared_matches_command(prepared, command) {
+                return rejected("PLAN_ABORT_IDENTITY_MISMATCH");
+            }
+        } else if let Some(applied) = self.spool.applied_order() {
+            if command.payload.plan_revision_id != applied.plan_revision_id
+                || command.payload.order_id != applied.order_id
+                || command.payload.order_update_id != applied.order_update_id
+                || command.payload.content_digest_sha256 != applied.content_digest_sha256
+            {
+                return rejected("PLAN_ABORT_IDENTITY_MISMATCH");
+            }
+        } else {
             return OrderDecision {
                 apply_to_robot: false,
                 disposition: CommandDisposition::Duplicate,
                 code: "PLAN_ABORT_NOOP",
             };
-        };
-        if !prepared_matches_command(prepared, command) {
-            return rejected("PLAN_ABORT_IDENTITY_MISMATCH");
         }
         OrderDecision {
             apply_to_robot: false,

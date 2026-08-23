@@ -28,8 +28,7 @@ impl Drop for ChildGuard {
 }
 
 #[tokio::test]
-#[ignore = "requires localhost process networking"]
-async fn core_and_operational_simulator_complete_one_order_as_separate_processes() {
+async fn core_and_wave3_operational_simulator_complete_one_planned_route() {
     let simulator_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let core_root = simulator_root.parent().unwrap().join("mapf-rl-core");
     let python = core_root.join(".venv/bin/python");
@@ -48,7 +47,7 @@ async fn core_and_operational_simulator_complete_one_order_as_separate_processes
         .arg(temp.path())
         .current_dir(&core_root)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let mut core = ChildGuard(core);
@@ -79,7 +78,7 @@ async fn core_and_operational_simulator_complete_one_order_as_separate_processes
         .env("MAPF_SIMULATOR_START_ROW", "2")
         .env("MAPF_SIMULATOR_EXIT_AFTER_COMPLETION", "true")
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let mut simulator = ChildGuard(simulator);
@@ -130,7 +129,7 @@ async fn core_and_operational_simulator_complete_one_order_as_separate_processes
         }
         assert!(
             Instant::now() < deadline,
-            "Order did not complete before timeout"
+            "Order did not complete before timeout: {snapshot}"
         );
         sleep(Duration::from_millis(100)).await;
     }
@@ -163,12 +162,17 @@ async fn wait_for_core(client: &reqwest::Client, rest_base: &str) {
 async fn wait_for_simulator_session(client: &reqwest::Client, rest_base: &str, api_key: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if client
+        let response = client
             .get(format!("{rest_base}api/v1/simulators/sim-1/snapshot"))
             .header("X-API-Key", api_key)
             .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
+            .await;
+        if let Ok(response) = response
+            && response.status().is_success()
+            && let Ok(snapshot) = response.json::<serde_json::Value>().await
+            && snapshot["robots"]
+                .as_array()
+                .is_some_and(|robots| robots.iter().any(|robot| robot["ready"] == true))
         {
             return;
         }

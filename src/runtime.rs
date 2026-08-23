@@ -2,7 +2,8 @@
 
 use crate::core_client::{CoreClient, CoreClientError, CoreWebSocket};
 use crate::protocol::{
-    OrderCommand, PoseReport, ReportAck, ReportEnvelope, SimulatorSnapshot, StreamWelcome,
+    EventSeverity, OrderCommand, PoseReport, ReportAck, ReportEnvelope, SimulatorSnapshot,
+    StreamWelcome,
 };
 use crate::session::{CoreSession, OrderDecision, SessionError, StreamSequenceDisposition};
 use crate::spool::{AppliedOrder, PreparedOrder};
@@ -13,6 +14,15 @@ pub struct Phase2Runtime {
     client: CoreClient,
     session: Arc<Mutex<CoreSession>>,
     websocket: Option<CoreWebSocket>,
+}
+
+pub struct IncidentReport {
+    pub event_id: uuid::Uuid,
+    pub severity: EventSeverity,
+    pub code: String,
+    pub simulation_time_ms: i64,
+    pub evidence: serde_json::Map<String, serde_json::Value>,
+    pub occurred_at: String,
 }
 
 impl Phase2Runtime {
@@ -116,6 +126,38 @@ impl Phase2Runtime {
         let report = self
             .session_call(move |session| {
                 let message_id = session.queue_order_completed(simulation_time_ms, occurred_at)?;
+                session
+                    .spool()
+                    .pending()
+                    .iter()
+                    .find(|report| report.message_id == message_id)
+                    .cloned()
+                    .ok_or(RuntimeError::MissingCompletionReport)
+            })
+            .await?;
+        if let Err(error) = self.write_without_accepting(&report).await {
+            self.websocket = None;
+            self.mark_disconnected(monotonic_ms).await?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub async fn publish_incident(
+        &mut self,
+        incident: IncidentReport,
+        monotonic_ms: u64,
+    ) -> Result<(), RuntimeError> {
+        let report = self
+            .session_call(move |session| {
+                let message_id = session.queue_incident(
+                    incident.event_id,
+                    incident.severity,
+                    incident.code,
+                    incident.simulation_time_ms,
+                    incident.evidence,
+                    incident.occurred_at,
+                )?;
                 session
                     .spool()
                     .pending()
