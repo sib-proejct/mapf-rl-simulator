@@ -5,7 +5,7 @@ use crate::protocol::{
     OrderCommand, PoseReport, ReportAck, ReportEnvelope, SimulatorSnapshot, StreamWelcome,
 };
 use crate::session::{CoreSession, OrderDecision, SessionError, StreamSequenceDisposition};
-use crate::spool::AppliedOrder;
+use crate::spool::{AppliedOrder, PreparedOrder};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -138,6 +138,11 @@ impl Phase2Runtime {
             .await
     }
 
+    pub async fn prepared_order(&self) -> Result<Option<PreparedOrder>, RuntimeError> {
+        self.session_call(|session| Ok(session.prepared_order().cloned()))
+            .await
+    }
+
     /// Handles one Core frame. Command application and its durable application ack
     /// happen before `OrderApplied` is returned; execution is reported only by a
     /// later periodic state report.
@@ -145,6 +150,16 @@ impl Phase2Runtime {
         &mut self,
         monotonic_ms: u64,
         occurred_at: String,
+    ) -> Result<RuntimeEvent, RuntimeError> {
+        self.receive_one_with_motion(monotonic_ms, occurred_at, false)
+            .await
+    }
+
+    pub async fn receive_one_with_motion(
+        &mut self,
+        monotonic_ms: u64,
+        occurred_at: String,
+        robot_is_stationary: bool,
     ) -> Result<RuntimeEvent, RuntimeError> {
         let next = self
             .websocket
@@ -172,19 +187,29 @@ impl Phase2Runtime {
                 let (stream, decision, acknowledgement) = self
                     .session_call(move |session| {
                         let stream = session.observe_stream_sequence(sequence);
-                        let decision = session.accept_order(&command, occurred_at)?;
+                        if stream == StreamSequenceDisposition::Gap {
+                            return Ok((stream, None, None));
+                        }
+                        let decision = session.accept_order_at(
+                            &command,
+                            occurred_at,
+                            monotonic_ms,
+                            robot_is_stationary,
+                        )?;
                         let acknowledgement = session
                             .spool()
                             .pending()
                             .last()
                             .cloned()
                             .ok_or(RuntimeError::MissingApplicationAck)?;
-                        Ok((stream, decision, acknowledgement))
+                        Ok((stream, Some(decision), Some(acknowledgement)))
                     })
                     .await?;
                 if stream == StreamSequenceDisposition::Gap {
                     return Err(RuntimeError::StreamGap);
                 }
+                let decision = decision.ok_or(RuntimeError::MissingApplicationAck)?;
+                let acknowledgement = acknowledgement.ok_or(RuntimeError::MissingApplicationAck)?;
                 if let Err(error) = self.write_without_accepting(&acknowledgement).await {
                     self.websocket = None;
                     self.mark_disconnected(monotonic_ms).await?;
@@ -201,14 +226,19 @@ impl Phase2Runtime {
                 let (stream, result) = self
                     .session_call(move |session| {
                         let stream = session.observe_stream_sequence(sequence);
+                        if stream == StreamSequenceDisposition::Gap {
+                            return Ok((stream, None));
+                        }
                         let result = session.accept_report_ack(&acknowledgement)?;
-                        Ok((stream, result))
+                        Ok((stream, Some(result)))
                     })
                     .await?;
                 if stream == StreamSequenceDisposition::Gap {
                     return Err(RuntimeError::StreamGap);
                 }
-                Ok(RuntimeEvent::ReportAcknowledged(result))
+                Ok(RuntimeEvent::ReportAcknowledged(
+                    result.ok_or(RuntimeError::InvalidCoreMessage)?,
+                ))
             }
             "stream.welcome" => Err(RuntimeError::UnexpectedWelcome),
             _ => Err(RuntimeError::InvalidCoreMessage),

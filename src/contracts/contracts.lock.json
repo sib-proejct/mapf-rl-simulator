@@ -22,7 +22,7 @@
     "fixtures/valid/problem.json": "0a5ad56e4305c719bd04ef741dde346fca073b84d86af5eb79b1ce658f0576a2",
     "fixtures/valid/robot-capability.json": "2f9f722f3101a78b715ee186a578373bb69263c4d95b4225de2cdb3cee568139",
     "fixtures/valid/ws-command-ack.json": "535055e23333e4cf871362e799a4205371796c1ca682376a3514bfc4b83b5818",
-    "fixtures/valid/ws-order-command.json": "9cc0f9000d945f7991544448e8315c96dbb91b8bf85728e808e7574826e8b599",
+    "fixtures/valid/ws-order-command.json": "cfb035e389fc19e5310f962253e9e4a9b9b94cce76684d3f4d4d7e89d793bf43",
     "fixtures/valid/ws-report-ack.json": "fe9129bdb5211afa0bea14184cbff64b75dab1d5bbc6439f613eb6141613c46c",
     "fixtures/valid/ws-robot-event-report.json": "79b36468fa914d50e40c66933296283a7354983e42395d9b419ec2076f9a5be0",
     "fixtures/valid/ws-robot-state-report.json": "17d4140cbf82952479373b15ba48d807a69cb6f5950531372e63506718275991",
@@ -37,10 +37,10 @@
     "schemas/policy-validation-vectors.schema.json": "bef97226a93e8607bd66feb53e0616c955830ff15705f15eefa4b4e935353148",
     "schemas/problem.schema.json": "1257872f991aae3cf413fe08cd3800b9ef242114433a02dc59e737eaf4c12d4e",
     "schemas/robot-capability.schema.json": "36c535c2507b824d9e6d5ba3885ce001672b58205d140a77b59a472126562746",
-    "schemas/ws.schema.json": "edde3f309a35cd80c463e1e94b3354a01e22f255a307683cd0a5bf6ffcc83efe",
+    "schemas/ws.schema.json": "b0a7749f3afc199beb958b76247d1cb53259b22e3b064391aad39b68b1c95e9d",
     "vendor/vda5050/3.0.0.lock.json": "f270df03a15ab7ce892d56eee534cab126725ca6bc06cd2f51197581689e3944",
     "vendor/vda5050/ADOPTION.md": "71a20f67c8d204d6e4a5cc97491fa11679b74c21fa573a7dd0c9cec4ffcd3c27"
   },
-  "sourceRevision": "WORKTREE",
-  "treeDigestSha256": "f4eb8afaba5528212e7f6814364c37c5add0af079144907b17f41e2966b43c60"
+  "sourceRevision": "8d3d7b174e403f34537c68514f3eba81bc773e6f",
+  "treeDigestSha256": "ec39ff9fe97800b7387d9633032fd36176fdcca59a227cf9088a6cb55c9d2a27"
 }

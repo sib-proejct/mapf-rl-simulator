@@ -72,6 +72,7 @@ pub struct StepRecord {
     pub applied_faults: Vec<ScheduledFault>,
 }
 
+#[derive(Clone)]
 pub struct SimulationEngine<C> {
     clock: C,
     robot_id: RobotId,
@@ -147,6 +148,42 @@ impl<C: MonotonicClock> SimulationEngine<C> {
 
     pub const fn map(&self) -> &GridMap {
         &self.map
+    }
+
+    pub const fn emergency_stop_latched(&self) -> bool {
+        self.emergency_stop_latched
+    }
+
+    pub(crate) fn latch_emergency_stop(&mut self) {
+        self.emergency_stop_latched = true;
+    }
+
+    pub(crate) fn restore_safety_state(
+        &mut self,
+        state: RobotState,
+        tick: ControlTick,
+        simulation_time: SimulationTimeMs,
+        emergency_stop_latched: bool,
+    ) -> Result<(), EngineError> {
+        if simulation_time.get()
+            != i64::try_from(tick.get())
+                .ok()
+                .and_then(|value| value.checked_mul(crate::types::CONTROL_TICK_MS))
+                .ok_or(ValidationError::TimeOverflow)?
+            || !initial_kinematics_are_valid(state, self.config.motion_limits)
+            || !self.safety.state_has_safe_emergency_stop(
+                &self.map,
+                state,
+                self.config.motion_limits,
+            )
+        {
+            return Err(EngineError::UnsafeRecoveryState);
+        }
+        self.state = state;
+        self.tick = tick;
+        self.simulation_time = simulation_time;
+        self.emergency_stop_latched = emergency_stop_latched;
+        Ok(())
     }
 
     /// Executes the fixed Phase 1 tick ordering and atomically commits at most one
@@ -227,6 +264,7 @@ pub enum EngineError {
     UnsafeInitialState,
     InvalidInitialKinematics,
     UnsafeInitialStoppingEnvelope,
+    UnsafeRecoveryState,
     CollisionInvariant,
 }
 
@@ -254,6 +292,9 @@ impl fmt::Display for EngineError {
             }
             Self::UnsafeInitialStoppingEnvelope => {
                 formatter.write_str("initial robot state has no collision-free emergency stop")
+            }
+            Self::UnsafeRecoveryState => {
+                formatter.write_str("checkpoint robot state is incompatible or unsafe")
             }
             Self::CollisionInvariant => {
                 formatter.write_str("no collision-free emergency transition can be committed")

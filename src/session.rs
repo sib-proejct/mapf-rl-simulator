@@ -6,7 +6,7 @@ use crate::protocol::{
     ReportEnvelope, ReportPayload, RobotEventPayload, RobotStatePayload, SimulatorSnapshot,
     StreamWelcome,
 };
-use crate::spool::{AckResult, AppliedOrder, DurableSpool, SpoolError};
+use crate::spool::{AckResult, AppliedOrder, DurableSpool, PreparedOrder, SpoolError};
 use std::fmt;
 use uuid::Uuid;
 
@@ -103,6 +103,10 @@ impl CoreSession {
         self.spool.applied_order()
     }
 
+    pub fn prepared_order(&self) -> Option<&PreparedOrder> {
+        self.spool.prepared_order()
+    }
+
     pub fn accept_welcome(&mut self, welcome: StreamWelcome) -> Result<(), SessionError> {
         welcome.validate()?;
         if welcome.stream_id != format!("simulator:{}", self.simulator_id) {
@@ -181,6 +185,18 @@ impl CoreSession {
         command: &OrderCommand,
         occurred_at: String,
     ) -> Result<OrderDecision, SessionError> {
+        self.accept_order_at(command, occurred_at, 0, false)
+    }
+
+    /// Phase 3 command path. `stationary` must be an observed local safety fact;
+    /// a PREPARE cannot be acknowledged merely because Core requested a hold.
+    pub fn accept_order_at(
+        &mut self,
+        command: &OrderCommand,
+        occurred_at: String,
+        monotonic_ms: u64,
+        stationary: bool,
+    ) -> Result<OrderDecision, SessionError> {
         command.validate()?;
         let epoch = self.session_epoch.ok_or(SessionError::NoSession)?;
         if command.session_epoch != epoch {
@@ -196,16 +212,48 @@ impl CoreSession {
             return Err(SessionError::RobotBinding);
         }
 
-        let decision = self.classify_order(command);
+        if self.spool.expire_prepared_order(monotonic_ms)? {
+            self.state = SessionState::Degraded;
+        }
+        let decision = self.classify_order(command, stationary);
         let applied_order = decision.apply_to_robot.then(|| AppliedOrder {
             command_id: command.payload.command_id,
             order_id: command.payload.order_id.clone(),
             order_update_id: command.payload.order_update_id,
             content_digest_sha256: command.payload.content_digest_sha256.clone(),
+            plan_revision_id: command.payload.plan_revision_id,
             goal: command.payload.goal,
         });
-        self.queue_command_ack(command, &decision, occurred_at, applied_order)?;
+        let prepared_order = (command.payload.phase == OrderPhase::Prepare
+            && decision.disposition == CommandDisposition::Prepared)
+            .then(|| PreparedOrder {
+                command_id: command.payload.command_id,
+                order_id: command.payload.order_id.clone(),
+                order_update_id: command.payload.order_update_id,
+                content_digest_sha256: command.payload.content_digest_sha256.clone(),
+                plan_revision_id: command
+                    .payload
+                    .plan_revision_id
+                    .expect("classified prepare"),
+                prepared_at_monotonic_ms: monotonic_ms,
+                goal: command.payload.goal,
+            });
+        self.queue_command_ack(
+            command,
+            &decision,
+            occurred_at,
+            applied_order,
+            prepared_order,
+        )?;
         Ok(decision)
+    }
+
+    pub fn poll_prepare_barrier(&mut self, monotonic_ms: u64) -> Result<bool, SessionError> {
+        let expired = self.spool.expire_prepared_order(monotonic_ms)?;
+        if expired {
+            self.state = SessionState::Degraded;
+        }
+        Ok(expired)
     }
 
     pub fn state_report_due(&mut self, monotonic_ms: u64) -> bool {
@@ -364,14 +412,97 @@ impl CoreSession {
         self.last_stream_sequence
     }
 
-    fn classify_order(&self, command: &OrderCommand) -> OrderDecision {
-        if command.payload.phase != OrderPhase::Activate {
+    fn classify_order(&self, command: &OrderCommand, stationary: bool) -> OrderDecision {
+        match command.payload.phase {
+            OrderPhase::Prepare => return self.classify_prepare(command, stationary),
+            OrderPhase::Abort => return self.classify_abort(command),
+            OrderPhase::Activate => {}
+        }
+        if command.payload.plan_revision_id.is_some() {
+            let Some(prepared) = self.spool.prepared_order() else {
+                return self.same_applied_order(command).unwrap_or(OrderDecision {
+                    apply_to_robot: false,
+                    disposition: CommandDisposition::Rejected,
+                    code: "PLAN_NOT_PREPARED",
+                });
+            };
+            if !prepared_matches_command(prepared, command) {
+                return OrderDecision {
+                    apply_to_robot: false,
+                    disposition: CommandDisposition::Rejected,
+                    code: "PLAN_PREPARE_IDENTITY_MISMATCH",
+                };
+            }
             return OrderDecision {
-                apply_to_robot: false,
-                disposition: CommandDisposition::Rejected,
-                code: "COMMAND_PHASE_UNSUPPORTED",
+                apply_to_robot: true,
+                disposition: CommandDisposition::Applied,
+                code: "PLAN_ACTIVATED",
             };
         }
+        self.classify_update(command)
+    }
+
+    fn classify_prepare(&self, command: &OrderCommand, stationary: bool) -> OrderDecision {
+        if command.payload.plan_revision_id.is_none() {
+            return rejected("PLAN_REVISION_ID_REQUIRED");
+        }
+        if !stationary {
+            return rejected("PLAN_SAFE_HOLD_INCOMPLETE");
+        }
+        if let Some(prepared) = self.spool.prepared_order() {
+            return if prepared_matches_command(prepared, command) {
+                OrderDecision {
+                    apply_to_robot: false,
+                    disposition: CommandDisposition::Duplicate,
+                    code: "PLAN_PREPARE_DUPLICATE",
+                }
+            } else {
+                rejected("PLAN_PREPARE_CONFLICT")
+            };
+        }
+        let sequence = self.classify_update(command);
+        if sequence.apply_to_robot {
+            OrderDecision {
+                apply_to_robot: false,
+                disposition: CommandDisposition::Prepared,
+                code: "PLAN_PREPARED",
+            }
+        } else {
+            sequence
+        }
+    }
+
+    fn classify_abort(&self, command: &OrderCommand) -> OrderDecision {
+        let Some(prepared) = self.spool.prepared_order() else {
+            return OrderDecision {
+                apply_to_robot: false,
+                disposition: CommandDisposition::Duplicate,
+                code: "PLAN_ABORT_NOOP",
+            };
+        };
+        if !prepared_matches_command(prepared, command) {
+            return rejected("PLAN_ABORT_IDENTITY_MISMATCH");
+        }
+        OrderDecision {
+            apply_to_robot: false,
+            disposition: CommandDisposition::Applied,
+            code: "PLAN_ABORTED",
+        }
+    }
+
+    fn same_applied_order(&self, command: &OrderCommand) -> Option<OrderDecision> {
+        let current = self.spool.applied_order()?;
+        (command.payload.order_id == current.order_id
+            && command.payload.order_update_id == current.order_update_id
+            && command.payload.content_digest_sha256 == current.content_digest_sha256)
+            .then_some(OrderDecision {
+                apply_to_robot: false,
+                disposition: CommandDisposition::Duplicate,
+                code: "COMMAND_DUPLICATE",
+            })
+    }
+
+    fn classify_update(&self, command: &OrderCommand) -> OrderDecision {
         let Some(current) = self.spool.applied_order() else {
             return if command.payload.order_update_id == 0 {
                 OrderDecision {
@@ -436,6 +567,7 @@ impl CoreSession {
         decision: &OrderDecision,
         occurred_at: String,
         applied_order: Option<AppliedOrder>,
+        prepared_order: Option<PreparedOrder>,
     ) -> Result<(), SessionError> {
         let epoch = self.session_epoch.ok_or(SessionError::NoSession)?;
         let report = ReportEnvelope {
@@ -460,7 +592,22 @@ impl CoreSession {
                 code: Some(decision.code.to_owned()),
             }),
         };
-        self.spool.enqueue_with_order(report, applied_order)?;
+        if let Some(prepared_order) = prepared_order {
+            self.spool
+                .enqueue_with_prepared_order(report, prepared_order)?;
+        } else if command.payload.phase == OrderPhase::Activate
+            && command.payload.plan_revision_id.is_some()
+            && decision.apply_to_robot
+        {
+            self.spool.enqueue_activating_prepared_order(
+                report,
+                applied_order.expect("classified activation"),
+            )?;
+        } else if command.payload.phase == OrderPhase::Abort && decision.code == "PLAN_ABORTED" {
+            self.spool.enqueue_aborting_prepared_order(report)?;
+        } else {
+            self.spool.enqueue_with_order(report, applied_order)?;
+        }
         Ok(())
     }
 
@@ -532,4 +679,19 @@ fn validate_id(value: &str, field: &'static str) -> Result<(), SessionError> {
         return Err(SessionError::InvalidIdentity(field));
     }
     Ok(())
+}
+
+fn rejected(code: &'static str) -> OrderDecision {
+    OrderDecision {
+        apply_to_robot: false,
+        disposition: CommandDisposition::Rejected,
+        code,
+    }
+}
+
+fn prepared_matches_command(prepared: &PreparedOrder, command: &OrderCommand) -> bool {
+    command.payload.plan_revision_id == Some(prepared.plan_revision_id)
+        && command.payload.order_id == prepared.order_id
+        && command.payload.order_update_id == prepared.order_update_id
+        && command.payload.content_digest_sha256 == prepared.content_digest_sha256
 }

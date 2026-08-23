@@ -5,14 +5,18 @@
 //! deterministic safety kernel accepts it.
 
 pub mod action;
+pub mod checkpoint;
 pub mod contracts;
 pub mod controller;
 pub mod core_client;
 pub mod fault;
+pub mod fleet;
 pub mod motion;
 pub mod operational;
+pub mod plan;
 pub mod protocol;
 pub mod random;
+pub mod report_queue;
 pub mod runtime;
 pub mod safety;
 pub mod scenario;

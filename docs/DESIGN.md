@@ -1,6 +1,6 @@
 # MAPF-RL Simulator 설계서
 
-> - 상태: Phase 2 Core session vertical slice 기준선 v0.5
+> - 상태: Phase 3 Multi-robot plan과 recovery 기준선 v0.6
 > - 대상 저장소: `mapf-rl-simulator`
 > - 기준일: 2026-08-22
 > - 상위 기준: [`../../mapf-rl-docs/ARCHITECTURE.md`](../../mapf-rl-docs/ARCHITECTURE.md)
@@ -13,9 +13,10 @@
 이 문서는 시스템 아키텍처가 정한 책임 경계를 Simulator 내부의 구현 가능한 구조로 구체화한다. Core 통신, Order 적용, simulation time, virtual robot, local ONNX inference, deterministic safety, telemetry와 복구 사이의 의존성 및 최초 구현 기준선을 정의한다.
 
 현재 저장소에는 generated contract representation과 compile/drift test, Phase 1의 single-robot
-deterministic engine 및 Phase 2의 authenticated Core session vertical slice가 구현되었다.
-Phase 2는 durable report spool, single Order 멱등 적용, 10 Hz WS state report와 5초 REST recovery를
-포함한다. Multi-robot plan과 ONNX runtime은 아직 없다.
+deterministic engine, Phase 2의 authenticated Core session vertical slice 및 Phase 3의 multi-robot
+plan/recovery domain이 구현되었다. Phase 3는 prepare barrier와 dependency activation, atomic fleet tick,
+stationary reservation, crossing/corridor/deadlock recovery, bounded priority report queue 및 fenced safety
+checkpoint recovery를 포함한다. ONNX runtime은 아직 없다.
 
 판단 표시는 다음과 같다.
 
@@ -1143,10 +1144,10 @@ Simulator는 server가 아직 지원하지 않는 contract로 먼저 message를 
 
 ### Phase 3 — Multi-robot plan과 recovery
 
-- `PlanRevision` prepare/hold/ack와 15초 barrier consumer
-- Safe activation dependency와 stationary reservation 처리
-- Crossing/corridor/deadlock/replan scenario
-- Report backpressure, process restart와 checkpoint recovery
+- [x] `PlanRevision` prepare/hold/ack와 15초 barrier consumer
+- [x] Safe activation dependency와 stationary reservation 처리
+- [x] Crossing/corridor/deadlock/replan scenario
+- [x] Report backpressure, process restart와 checkpoint recovery
 
 ### Phase 4 — Policy package와 inference
 

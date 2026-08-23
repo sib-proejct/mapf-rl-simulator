@@ -24,6 +24,21 @@ pub struct AppliedOrder {
     pub order_update_id: u64,
     pub content_digest_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<OrderGoal>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreparedOrder {
+    pub command_id: Uuid,
+    pub order_id: String,
+    pub order_update_id: u64,
+    pub content_digest_sha256: String,
+    pub plan_revision_id: Uuid,
+    pub prepared_at_monotonic_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<OrderGoal>,
 }
 
@@ -43,7 +58,11 @@ struct SpoolBody {
     next_report_sequence: u64,
     pending: Vec<ReportEnvelope>,
     dead_letters: Vec<DeadLetter>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    dead_letters_dropped: u64,
     applied_order: Option<AppliedOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_order: Option<PreparedOrder>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,10 +112,22 @@ impl DurableSpool {
             for report in &document.body.pending {
                 report.validate().map_err(|_| SpoolError::Corrupt)?;
             }
+            let mut recovered = document.body;
+            // PREPARE and plan activation authority never survive a process boot.
+            // The safety checkpoint retains their identities for reconciliation,
+            // but the command spool cannot use them to resume motion.
+            recovered.prepared_order = None;
+            if recovered
+                .applied_order
+                .as_ref()
+                .is_some_and(|order| order.plan_revision_id.is_some())
+            {
+                recovered.applied_order = None;
+            }
             SpoolBody {
                 current_boot_id: boot_id,
                 next_report_sequence: 0,
-                ..document.body
+                ..recovered
             }
         } else {
             SpoolBody {
@@ -106,7 +137,9 @@ impl DurableSpool {
                 next_report_sequence: 0,
                 pending: Vec::new(),
                 dead_letters: Vec::new(),
+                dead_letters_dropped: 0,
                 applied_order: None,
+                prepared_order: None,
             }
         };
         let spool = Self {
@@ -138,8 +171,16 @@ impl DurableSpool {
         &self.body.dead_letters
     }
 
+    pub const fn dead_letters_dropped(&self) -> u64 {
+        self.body.dead_letters_dropped
+    }
+
     pub const fn applied_order(&self) -> Option<&AppliedOrder> {
         self.body.applied_order.as_ref()
+    }
+
+    pub const fn prepared_order(&self) -> Option<&PreparedOrder> {
+        self.body.prepared_order.as_ref()
     }
 
     pub fn enqueue(&mut self, report: ReportEnvelope) -> Result<(), SpoolError> {
@@ -150,6 +191,42 @@ impl DurableSpool {
         &mut self,
         report: ReportEnvelope,
         applied_order: Option<AppliedOrder>,
+    ) -> Result<(), SpoolError> {
+        self.enqueue_with_command_checkpoint(report, applied_order, PreparedOrderUpdate::Keep)
+    }
+
+    pub(crate) fn enqueue_with_prepared_order(
+        &mut self,
+        report: ReportEnvelope,
+        prepared_order: PreparedOrder,
+    ) -> Result<(), SpoolError> {
+        self.enqueue_with_command_checkpoint(report, None, PreparedOrderUpdate::Set(prepared_order))
+    }
+
+    pub(crate) fn enqueue_activating_prepared_order(
+        &mut self,
+        report: ReportEnvelope,
+        applied_order: AppliedOrder,
+    ) -> Result<(), SpoolError> {
+        self.enqueue_with_command_checkpoint(
+            report,
+            Some(applied_order),
+            PreparedOrderUpdate::Clear,
+        )
+    }
+
+    pub(crate) fn enqueue_aborting_prepared_order(
+        &mut self,
+        report: ReportEnvelope,
+    ) -> Result<(), SpoolError> {
+        self.enqueue_with_command_checkpoint(report, None, PreparedOrderUpdate::Clear)
+    }
+
+    fn enqueue_with_command_checkpoint(
+        &mut self,
+        report: ReportEnvelope,
+        applied_order: Option<AppliedOrder>,
+        prepared_order: PreparedOrderUpdate,
     ) -> Result<(), SpoolError> {
         report.validate().map_err(|_| SpoolError::InvalidReport)?;
         if self.body.pending.len() >= self.capacity {
@@ -171,7 +248,29 @@ impl DurableSpool {
         if let Some(order) = applied_order {
             self.body.applied_order = Some(order);
         }
+        match prepared_order {
+            PreparedOrderUpdate::Keep => {}
+            PreparedOrderUpdate::Set(order) => self.body.prepared_order = Some(order),
+            PreparedOrderUpdate::Clear => self.body.prepared_order = None,
+        }
         self.persist_or_rollback(previous)
+    }
+
+    pub(crate) fn expire_prepared_order(&mut self, monotonic_ms: u64) -> Result<bool, SpoolError> {
+        let Some(prepared) = &self.body.prepared_order else {
+            return Ok(false);
+        };
+        if monotonic_ms
+            < prepared
+                .prepared_at_monotonic_ms
+                .saturating_add(crate::plan::PREPARE_BARRIER_TIMEOUT_MS)
+        {
+            return Ok(false);
+        }
+        let previous = self.body.clone();
+        self.body.prepared_order = None;
+        self.persist_or_rollback(previous)?;
+        Ok(true)
     }
 
     /// Rebinds only this process's pending reports. Reports recovered from an old
@@ -236,6 +335,10 @@ impl DurableSpool {
         let previous = self.body.clone();
         let report = self.body.pending.remove(index);
         let result = if disposition == ReportDisposition::Rejected {
+            if self.body.dead_letters.len() >= self.capacity {
+                self.body.dead_letters.remove(0);
+                self.body.dead_letters_dropped = self.body.dead_letters_dropped.saturating_add(1);
+            }
             self.body.dead_letters.push(DeadLetter {
                 code: code.to_owned(),
                 report,
@@ -310,6 +413,12 @@ fn completion_matches_applied_order(
             .get("orderUpdateId")
             .and_then(serde_json::Value::as_u64)
             == Some(applied.order_update_id)
+}
+
+enum PreparedOrderUpdate {
+    Keep,
+    Set(PreparedOrder),
+    Clear,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -399,4 +508,8 @@ fn validate_uuid_v4(value: Uuid) -> Result<(), SpoolError> {
         return Err(SpoolError::InvalidUuid);
     }
     Ok(())
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }

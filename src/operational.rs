@@ -124,10 +124,15 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         tokio::select! {
             _ = interval.tick() => {
                 let applied = runtime.applied_order().await?;
-                let action = applied
-                    .as_ref()
-                    .and_then(|order| order.goal)
-                    .map_or(0, |goal| action_toward_goal(&engine, goal));
+                let preparing = runtime.prepared_order().await?.is_some();
+                let action = if preparing {
+                    0
+                } else {
+                    applied
+                        .as_ref()
+                        .and_then(|order| order.goal)
+                        .map_or(0, |goal| action_toward_goal(&engine, goal))
+                };
                 let record = engine.step(action)?;
                 let occurred_at = utc_now_milliseconds()?;
                 runtime.publish_state_if_due(
@@ -154,7 +159,12 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                     completion_queued = true;
                 }
             }
-            event = runtime.receive_one(monotonic_ms, utc_now_milliseconds()?) => {
+            event = runtime.receive_one_with_motion(
+                monotonic_ms,
+                utc_now_milliseconds()?,
+                engine.state().velocity().magnitude() < 1.0e-6
+                    && engine.state().acceleration().magnitude() < 1.0e-6,
+            ) => {
                 match event? {
                     RuntimeEvent::Order { decision, command } => {
                         if decision.apply_to_robot {
