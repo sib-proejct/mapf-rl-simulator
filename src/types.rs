@@ -298,7 +298,7 @@ impl RobotState {
         self.yaw.get()
     }
 
-    pub(crate) const fn transitioned(
+    pub(crate) fn transitioned(
         self,
         position: WorldPosition,
         velocity: Velocity,
@@ -308,7 +308,12 @@ impl RobotState {
             position,
             velocity,
             acceleration,
-            yaw: self.yaw,
+            // Holonomic heading follows translation; a stopped robot retains its heading.
+            yaw: if velocity.magnitude() > 1.0e-9 {
+                Radians(velocity.y_mps().atan2(velocity.x_mps()))
+            } else {
+                self.yaw
+            },
         }
     }
 }

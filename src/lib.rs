@@ -25,5 +25,6 @@ pub mod sensing;
 pub mod session;
 pub mod simulation;
 pub mod spool;
+pub mod station;
 pub mod types;
 pub mod world;

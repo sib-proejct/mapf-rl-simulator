@@ -10,7 +10,7 @@ use crate::protocol::{
     CommandDisposition, EventSeverity, MapIdentity, OrderCommand, OrderGoal, OrderPhase,
     PoseReport, RasterMapContent,
 };
-use crate::route::action_for_route;
+use crate::route::{NODE_CENTER_TOLERANCE_METERS, action_toward_position, target_for_route};
 use crate::runtime::{IncidentReport, Phase2Runtime, RuntimeEvent};
 use crate::safety::SafetyConfig;
 use crate::sensing::SensorConfig;
@@ -42,6 +42,8 @@ struct OperationalConfig {
     start: GridCell,
     master_seed: u64,
     exit_after_completion: bool,
+    station_config: crate::station::StationConfig,
+    initial_battery_percent: f64,
 }
 
 impl OperationalConfig {
@@ -77,6 +79,15 @@ impl OperationalConfig {
                 parse_or("MAPF_SIMULATOR_START_ROW", 0)?,
             ),
             master_seed: parse_or("MAPF_SIMULATOR_MASTER_SEED", 0x5eed_2026)?,
+            station_config: crate::station::StationConfig {
+                pick_duration_ms: parse_or("MAPF_SIMULATOR_PICK_DURATION_MS", 2000)?,
+                place_duration_ms: parse_or("MAPF_SIMULATOR_PLACE_DURATION_MS", 2000)?,
+                charge_percent_per_second: parse_or(
+                    "MAPF_SIMULATOR_CHARGE_PERCENT_PER_SECOND",
+                    1.0,
+                )?,
+            },
+            initial_battery_percent: parse_or("MAPF_SIMULATOR_INITIAL_BATTERY_PERCENT", 100.0)?,
             exit_after_completion: parse_bool_or("MAPF_SIMULATOR_EXIT_AFTER_COMPLETION", false)?,
         })
     }
@@ -84,6 +95,15 @@ impl OperationalConfig {
 
 pub async fn run() -> Result<(), Box<dyn Error>> {
     let config = OperationalConfig::from_environment()?;
+    if config.station_config.pick_duration_ms == 0
+        || config.station_config.place_duration_ms == 0
+        || !config.station_config.charge_percent_per_second.is_finite()
+        || config.station_config.charge_percent_per_second <= 0.0
+        || !config.initial_battery_percent.is_finite()
+        || !(0.0..=100.0).contains(&config.initial_battery_percent)
+    {
+        return Err(invalid("invalid station simulation configuration").into());
+    }
     let controller = BaselineController::explicit(config.profile)?;
     let spool = DurableSpool::open(&config.spool_path, &config.simulator_id)?;
     let session = CoreSession::new(
@@ -93,12 +113,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         controller.report().clone(),
         spool,
     )?;
-    let client = CoreClient::new(CoreClientConfig::new(
+    let client = CoreClient::new(CoreClientConfig::new_with_local_compose(
         config.profile,
         config.simulator_id.clone(),
         config.rest_base_url,
         config.websocket_url,
         config.api_key,
+        parse_bool_or("MAPF_SIMULATOR_LOCAL_COMPOSE", false)?,
     )?)?;
     let mut runtime = Phase2Runtime::new(client, session);
     let started = Instant::now();
@@ -133,16 +154,24 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     let robot_id = RobotId::new(config.robot_id.clone())?;
     let mut fleet = MultiRobotEngine::new([engine], FleetConfig::new(0.5, 50)?)?;
     let checkpoint_store = CheckpointStore::new(&config.checkpoint_path)?;
+    let mut station = crate::station::StationState {
+        battery_percent: config.initial_battery_percent,
+        ..Default::default()
+    };
     let mut plans = PlanCoordinator::new();
     let mut restart_plan_revision_id = None;
     if let Some(checkpoint) = checkpoint_store
         .load_for_restart(&config.simulator_id, &config.map.content_digest_sha256)?
     {
+        if let Some(state) = checkpoint.station_states.get(&config.robot_id) {
+            station = state.clone();
+        }
         plans = fleet.restore_checkpoint(&checkpoint)?;
         restart_plan_revision_id = plans.active_revision_id();
     }
     let mut completion_queued = false;
     let mut recovery_reported = false;
+    let mut station_failure_reported = false;
     let mut interval = tokio::time::interval(Duration::from_millis(100));
 
     loop {
@@ -152,31 +181,36 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 let applied = runtime.applied_order().await?;
                 let preparing = runtime.prepared_order().await?.is_some();
                 let engine = &fleet.robots()[&robot_id];
+                let stopped_at_goal_before_tick = applied.as_ref().and_then(|order| order.goal).is_some_and(|goal| goal_reached_and_stopped(engine, goal));
                 let mut route_deviation = false;
-                let action = if preparing {
-                    0
+                let abort_pending = runtime.abort_pending().await?;
+                let target = if preparing || abort_pending {
+                    None
                 } else if let Some(order) = &applied {
                     if let Some(route) = &order.route {
-                        match action_for_route(
+                        match target_for_route(
                             engine.map(),
                             engine.state().position(),
                             engine.simulation_time(),
                             route,
                         ) {
-                            Ok(action) => action,
+                            Ok(target) => Some(target),
                             Err(_) => {
                                 route_deviation = true;
-                                0
+                                None
                             }
                         }
                     } else {
-                        order.goal.map_or(0, |goal| action_toward_goal(engine, goal))
+                        order.goal.and_then(|goal| engine.map().grid_to_world(GridCell::new(goal.column, goal.row)).ok())
                     }
                 } else {
-                    0
+                    None
                 };
-                let step = fleet.step(
+                let action = target.map_or(0, |target| action_toward_position(engine.state().position(), target));
+                let targets = target.map(|target| BTreeMap::from([(robot_id.clone(), target)])).unwrap_or_default();
+                let step = fleet.step_with_targets(
                     &BTreeMap::from([(robot_id.clone(), action)]),
+                    &targets,
                     &mut plans,
                 )?;
                 let record = step.records.get(&robot_id).ok_or_else(|| {
@@ -232,11 +266,27 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                         .await?;
                     recovery_reported = true;
                 }
+                let station_safe = !abort_pending && runtime.synchronized().await? && plans.motion_authorized(&config.robot_id) && !engine.emergency_stop_latched() && !route_deviation && step.recovery.is_none() && record.safety_outcome == crate::safety::SafetyOutcome::Accept;
+                if let Some(order) = &applied && let Some(action) = order.arrival_action {
+                    let arrived = order.goal.is_some_and(|goal| goal_reached_and_stopped(engine, goal));
+                    station.advance(&order.order_id, action, station_safe && arrived && stopped_at_goal_before_tick && !preparing, 100, config.station_config);
+                }
+                runtime.set_station_state(station.clone(), station_safe || applied.is_none() && !abort_pending && !engine.emergency_stop_latched() && !route_deviation && step.recovery.is_none() && record.safety_outcome == crate::safety::SafetyOutcome::Accept).await?;
                 save_checkpoint(&checkpoint_store, fleet.checkpoint(
                     config.simulator_id.clone(),
                     config.map.content_digest_sha256.clone(),
                     plans.clone(),
-                )).await?;
+                ).with_station_state(config.robot_id.clone(), station.clone())).await?;
+                if station.phase == crate::station::StationPhase::Failed && !station_failure_reported {
+                    let mut evidence = serde_json::Map::new();
+                    evidence.insert("stationState".to_owned(), serde_json::to_value(&station)?);
+                    runtime.publish_incident(IncidentReport { event_id: Uuid::new_v4(), severity: EventSeverity::Critical, code: "STATION_ACTION_FAILED".to_owned(), simulation_time_ms: engine.simulation_time().get(), evidence, occurred_at: utc_now_milliseconds()? }, monotonic_ms).await?;
+                    station_failure_reported = true;
+                }
+                if abort_pending && engine.state().velocity().magnitude() < 1.0e-6
+                    && engine.state().acceleration().magnitude() < 1.0e-6 {
+                    runtime.finish_abort_if_stopped(utc_now_milliseconds()?).await?;
+                }
                 let occurred_at = utc_now_milliseconds()?;
                 runtime.publish_state_if_due(
                     monotonic_ms,
@@ -270,9 +320,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                         .await?;
                     restart_plan_revision_id = None;
                 }
-                if !completion_queued
+                if !completion_queued && !abort_pending
                     && applied.as_ref().is_some_and(|order| {
-                        order.goal.is_some_and(|goal| goal_reached_and_stopped(engine, goal))
+                        station_safe && order.arrival_action.is_none_or(|action| station.completed(&order.order_id, action))
+                            && order.goal.is_some_and(|goal| goal_reached_and_stopped(engine, goal))
                             && order.route.as_ref().is_none_or(|route| {
                                 route.waypoints.last().is_some_and(|waypoint| {
                                     engine.simulation_time().get()
@@ -309,7 +360,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                                 true,
                                 monotonic_ms,
                             )?;
-                        } else if command.payload.phase == OrderPhase::Abort {
+                        } else if command.payload.phase == OrderPhase::Abort
+                            && decision.disposition != CommandDisposition::Rejected {
                             if let Some(plan_revision_id) = command.payload.plan_revision_id
                                 && plans.active_revision_id() == Some(plan_revision_id)
                             {
@@ -361,6 +413,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                                     monotonic_ms,
                                 )?;
                             }
+                            station_failure_reported = false;
                             completion_queued = false;
                             recovery_reported = false;
                         }
@@ -368,7 +421,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                             config.simulator_id.clone(),
                             config.map.content_digest_sha256.clone(),
                             plans.clone(),
-                        )).await?;
+                        ).with_station_state(config.robot_id.clone(), station.clone())).await?;
                     }
                     RuntimeEvent::ReportAcknowledged(_) => {
                         if completion_queued && runtime.applied_order().await?.is_none() {
@@ -377,10 +430,11 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                                 config.simulator_id.clone(),
                                 config.map.content_digest_sha256.clone(),
                                 plans.clone(),
-                            )).await?;
+                            ).with_station_state(config.robot_id.clone(), station.clone())).await?;
                             if config.exit_after_completion {
                                 return Ok(());
                             }
+                            station_failure_reported = false;
                             completion_queued = false;
                         }
                     }
@@ -467,33 +521,20 @@ fn validate_goal(map: &GridMap, goal: OrderGoal) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn action_toward_goal(engine: &SimulationEngine<ManualMonotonicClock>, goal: OrderGoal) -> i32 {
-    let Ok(cell) = engine.map().world_to_grid(engine.state().position()) else {
-        return 0;
-    };
-    if cell.column() < goal.column {
-        2
-    } else if cell.column() > goal.column {
-        4
-    } else if cell.row() < goal.row {
-        1
-    } else if cell.row() > goal.row {
-        3
-    } else {
-        0
-    }
-}
-
 fn goal_reached_and_stopped(
     engine: &SimulationEngine<ManualMonotonicClock>,
     goal: OrderGoal,
 ) -> bool {
     engine
         .map()
-        .world_to_grid(engine.state().position())
-        .is_ok_and(|cell| cell == GridCell::new(goal.column, goal.row))
-        && engine.state().velocity().x_mps().abs() < 1.0e-6
-        && engine.state().velocity().y_mps().abs() < 1.0e-6
+        .grid_to_world(GridCell::new(goal.column, goal.row))
+        .is_ok_and(|center| {
+            (engine.state().position().x_meters() - center.x_meters())
+                .hypot(engine.state().position().y_meters() - center.y_meters())
+                <= NODE_CENTER_TOLERANCE_METERS
+        })
+        && engine.state().velocity().magnitude() < 1.0e-6
+        && engine.state().acceleration().magnitude() < 1.0e-6
 }
 
 fn required(name: &'static str) -> Result<String, io::Error> {

@@ -9,7 +9,7 @@ use mapf_rl_simulator::types::{
 };
 use mapf_rl_simulator::world::{GridCell, GridMap};
 
-const DEMO_GOLDEN_DIGEST: &str = "67bf8a9ed0dd2af9212c6b659eaae9677d3709eeaadcd9286874304e321aa6f6";
+const DEMO_GOLDEN_DIGEST: &str = "8f2ac924e61a2f70b78cd1490da4e46f1985aaf96b2310da0d2f8a74cf955a95";
 
 #[test]
 fn same_scenario_and_seed_match_the_golden_digest() {

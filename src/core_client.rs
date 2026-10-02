@@ -58,13 +58,32 @@ impl CoreClientConfig {
         websocket_url: Url,
         api_key: ApiKey,
     ) -> Result<Self, CoreClientError> {
+        Self::new_with_local_compose(
+            profile,
+            simulator_id,
+            rest_base_url,
+            websocket_url,
+            api_key,
+            false,
+        )
+    }
+
+    /// Explicit local-only Docker service transport; other profiles still require TLS.
+    pub fn new_with_local_compose(
+        profile: RuntimeProfile,
+        simulator_id: String,
+        rest_base_url: Url,
+        websocket_url: Url,
+        api_key: ApiKey,
+        local_compose: bool,
+    ) -> Result<Self, CoreClientError> {
         if simulator_id.is_empty()
             || simulator_id.len() > 128
             || simulator_id.chars().any(char::is_control)
         {
             return Err(CoreClientError::InvalidSimulatorId);
         }
-        validate_transport(profile, &rest_base_url, &websocket_url)?;
+        validate_transport(profile, &rest_base_url, &websocket_url, local_compose)?;
         Ok(Self {
             profile,
             simulator_id,
@@ -323,16 +342,19 @@ fn validate_transport(
     profile: RuntimeProfile,
     rest: &Url,
     websocket: &Url,
+    local_compose: bool,
 ) -> Result<(), CoreClientError> {
     let secure = rest.scheme() == "https" && websocket.scheme() == "wss";
     if secure {
         return Ok(());
     }
+    let compose_endpoint =
+        |url: &Url| local_compose && url.host_str() == Some("core") && url.port() == Some(8000);
     if profile != RuntimeProfile::Local
         || rest.scheme() != "http"
         || websocket.scheme() != "ws"
-        || !is_loopback(rest)
-        || !is_loopback(websocket)
+        || !(is_loopback(rest) || compose_endpoint(rest))
+        || !(is_loopback(websocket) || compose_endpoint(websocket))
     {
         return Err(CoreClientError::InsecureTransport);
     }

@@ -5,7 +5,9 @@ use crate::protocol::{
     EventSeverity, OrderCommand, PoseReport, ReportAck, ReportEnvelope, SimulatorSnapshot,
     StreamWelcome,
 };
-use crate::session::{CoreSession, OrderDecision, SessionError, StreamSequenceDisposition};
+use crate::session::{
+    CoreSession, OrderDecision, SessionError, SessionState, StreamSequenceDisposition,
+};
 use crate::spool::{AppliedOrder, PreparedOrder};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -51,6 +53,21 @@ impl Phase2Runtime {
     }
 
     async fn connect_inner(&mut self) -> Result<SimulatorSnapshot, RuntimeError> {
+        let pending = self
+            .session_call(|session| Ok(session.spool().pending().to_vec()))
+            .await?;
+        if pending.len() > 100 {
+            // Drain large recovery queues before opening WS, so recovery cannot
+            // block WS acks or leave its ping/pong exchange unattended.
+            for reports in pending.chunks(100) {
+                let outcome = self.client.submit_report_batch(reports).await?;
+                self.session_call(move |session| {
+                    session.accept_report_batch(&outcome)?;
+                    Ok(())
+                })
+                .await?;
+            }
+        }
         let resume_after = self
             .session_call(|session| Ok(session.resume_after()))
             .await?;
@@ -115,6 +132,24 @@ impl Phase2Runtime {
             return Err(error.into());
         }
         Ok(true)
+    }
+
+    pub async fn set_station_state(
+        &mut self,
+        state: crate::station::StationState,
+        safe: bool,
+    ) -> Result<(), RuntimeError> {
+        self.session_call(move |session| {
+            session.set_station_state(state, safe);
+            Ok(())
+        })
+        .await
+    }
+    pub async fn synchronized(&self) -> Result<bool, RuntimeError> {
+        self.session_call(|session| {
+            Ok(session.state() == crate::session::SessionState::Synchronized)
+        })
+        .await
     }
 
     pub async fn publish_order_completed(
@@ -185,6 +220,38 @@ impl Phase2Runtime {
             .await
     }
 
+    pub async fn abort_pending(&self) -> Result<bool, RuntimeError> {
+        self.session_call(|session| Ok(session.spool().pending_abort().is_some()))
+            .await
+    }
+
+    /// Called only after a stopped physical state has been checkpointed.
+    pub async fn finish_abort_if_stopped(
+        &mut self,
+        occurred_at: String,
+    ) -> Result<(), RuntimeError> {
+        let report = self
+            .session_call(move |session| {
+                if session.state() != SessionState::Synchronized {
+                    return Ok(None);
+                }
+                let Some(command) = session.spool().pending_abort().cloned() else {
+                    return Ok(None);
+                };
+                // Reconnection must obtain a command rebound to the current epoch.
+                if Some(command.session_epoch) != session.session_epoch() {
+                    return Ok(None);
+                }
+                session.accept_order_at(&command, occurred_at, 0, true)?;
+                Ok(session.spool().pending().last().cloned())
+            })
+            .await?;
+        if let Some(report) = report {
+            self.write_without_accepting(&report).await?;
+        }
+        Ok(())
+    }
+
     /// Handles one Core frame. Command application and its durable application ack
     /// happen before `OrderApplied` is returned; execution is reported only by a
     /// later periodic state report.
@@ -238,6 +305,9 @@ impl Phase2Runtime {
                             monotonic_ms,
                             robot_is_stationary,
                         )?;
+                        if decision.code == "PLAN_ABORT_STOPPING" {
+                            return Ok((stream, Some(decision), None));
+                        }
                         let acknowledgement = session
                             .spool()
                             .pending()
@@ -251,8 +321,9 @@ impl Phase2Runtime {
                     return Err(RuntimeError::StreamGap);
                 }
                 let decision = decision.ok_or(RuntimeError::MissingApplicationAck)?;
-                let acknowledgement = acknowledgement.ok_or(RuntimeError::MissingApplicationAck)?;
-                if let Err(error) = self.write_without_accepting(&acknowledgement).await {
+                if let Some(acknowledgement) = acknowledgement
+                    && let Err(error) = self.write_without_accepting(&acknowledgement).await
+                {
                     self.websocket = None;
                     self.mark_disconnected(monotonic_ms).await?;
                     return Err(error);

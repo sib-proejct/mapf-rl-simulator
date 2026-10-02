@@ -66,11 +66,21 @@ pub struct RecoveryCheckpoint {
     pub robots: Vec<RobotSafetyCheckpoint>,
     pub plans: PlanCoordinator,
     pub no_progress_ticks: u32,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub station_states: std::collections::BTreeMap<String, crate::station::StationState>,
     /// Always true after a persisted checkpoint is loaded in a new process.
     pub requires_core_reconciliation: bool,
 }
 
 impl RecoveryCheckpoint {
+    pub fn with_station_state(
+        mut self,
+        robot_id: String,
+        state: crate::station::StationState,
+    ) -> Self {
+        self.station_states.insert(robot_id, state);
+        self
+    }
     pub fn validate(&self) -> Result<(), CheckpointError> {
         if self.simulator_id.is_empty()
             || self.simulator_id.len() > 128
@@ -79,6 +89,11 @@ impl RecoveryCheckpoint {
             || self.robots.is_empty()
             || self.robots.len() > MAX_CHECKPOINT_ROBOTS
         {
+            return Err(CheckpointError::Corrupt);
+        }
+        if self.station_states.iter().any(|(id, state)| {
+            !state.valid() || !self.robots.iter().any(|robot| &robot.robot_id == id)
+        }) {
             return Err(CheckpointError::Corrupt);
         }
         let mut ids = std::collections::BTreeSet::new();

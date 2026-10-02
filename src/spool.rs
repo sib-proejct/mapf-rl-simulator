@@ -4,7 +4,8 @@
 //! a Tokio blocking boundary, never while occupying an async network task.
 
 use crate::protocol::{
-    OrderGoal, OrderRoute, ReportAckPayload, ReportDisposition, ReportEnvelope, ReportPayload,
+    OrderCommand, OrderGoal, OrderRoute, ReportAckPayload, ReportDisposition, ReportEnvelope,
+    ReportPayload,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +30,8 @@ pub struct AppliedOrder {
     pub goal: Option<OrderGoal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<OrderRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrival_action: Option<crate::contracts::generated::StationAction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,6 +49,8 @@ pub struct PreparedOrder {
     // They must remain readable so startup can fence and clear stale PREPARE state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<OrderRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrival_action: Option<crate::contracts::generated::StationAction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -69,6 +74,12 @@ struct SpoolBody {
     applied_order: Option<AppliedOrder>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepared_order: Option<PreparedOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_abort: Option<OrderCommand>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    aborted_orders: std::collections::BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    completed_orders: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,6 +157,9 @@ impl DurableSpool {
                 dead_letters_dropped: 0,
                 applied_order: None,
                 prepared_order: None,
+                pending_abort: None,
+                aborted_orders: std::collections::BTreeMap::new(),
+                completed_orders: std::collections::BTreeSet::new(),
             }
         };
         let spool = Self {
@@ -187,6 +201,27 @@ impl DurableSpool {
 
     pub const fn prepared_order(&self) -> Option<&PreparedOrder> {
         self.body.prepared_order.as_ref()
+    }
+
+    pub fn pending_abort(&self) -> Option<&OrderCommand> {
+        self.body.pending_abort.as_ref()
+    }
+
+    pub fn was_completed(&self, order_id: &str) -> bool {
+        self.body.completed_orders.contains(order_id)
+    }
+
+    pub fn was_aborted(&self, order_id: &str, update_id: u64) -> bool {
+        self.body
+            .aborted_orders
+            .get(order_id)
+            .is_some_and(|version| update_id <= *version)
+    }
+
+    pub(crate) fn defer_abort(&mut self, command: OrderCommand) -> Result<(), SpoolError> {
+        let previous = self.body.clone();
+        self.body.pending_abort = Some(command);
+        self.persist_or_rollback(previous)
     }
 
     pub fn enqueue(&mut self, report: ReportEnvelope) -> Result<(), SpoolError> {
@@ -235,11 +270,30 @@ impl DurableSpool {
         &mut self,
         report: ReportEnvelope,
     ) -> Result<(), SpoolError> {
-        self.enqueue_with_command_checkpoint(
-            report,
-            AppliedOrderUpdate::Clear,
-            PreparedOrderUpdate::Clear,
-        )
+        let ReportPayload::CommandAck(ack) = &report.payload else {
+            return Err(SpoolError::InvalidReport);
+        };
+        let applied = if self
+            .body
+            .applied_order
+            .as_ref()
+            .is_some_and(|order| order.order_id == ack.order_id)
+        {
+            AppliedOrderUpdate::Clear
+        } else {
+            AppliedOrderUpdate::Keep
+        };
+        let prepared = if self
+            .body
+            .prepared_order
+            .as_ref()
+            .is_some_and(|order| order.order_id == ack.order_id)
+        {
+            PreparedOrderUpdate::Clear
+        } else {
+            PreparedOrderUpdate::Keep
+        };
+        self.enqueue_with_command_checkpoint(report, applied, prepared)
     }
 
     fn enqueue_with_command_checkpoint(
@@ -264,6 +318,19 @@ impl DurableSpool {
             .next_report_sequence
             .checked_add(1)
             .ok_or(SpoolError::SequenceExhausted)?;
+        if let ReportPayload::CommandAck(ack) = &report.payload
+            && matches!(
+                ack.code.as_deref(),
+                Some("PLAN_ABORTED_STOPPED" | "PLAN_ABORT_NOOP_STOPPED")
+            )
+        {
+            self.body
+                .aborted_orders
+                .entry(ack.order_id.clone())
+                .and_modify(|version| *version = (*version).max(ack.order_update_id))
+                .or_insert(ack.order_update_id);
+            self.body.pending_abort = None;
+        }
         self.body.pending.push(report);
         match applied_order {
             AppliedOrderUpdate::Keep => {}
@@ -367,6 +434,15 @@ impl DurableSpool {
             });
             AckResult::DeadLettered
         } else {
+            if let ReportPayload::RobotEvent(event) = &report.payload
+                && event.code == "ORDER_COMPLETED"
+                && let Some(order_id) = event
+                    .evidence
+                    .get("orderId")
+                    .and_then(serde_json::Value::as_str)
+            {
+                self.body.completed_orders.insert(order_id.to_owned());
+            }
             if clears_applied_order {
                 self.body.applied_order = None;
             }

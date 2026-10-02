@@ -6,6 +6,7 @@ use crate::safety::{SafetyError, SafetyKernel, SafetyOutcome, SafetyReason};
 use crate::sensing::{SeededSensor, SensorConfig, SensorReading};
 use crate::types::{
     ControlTick, MonotonicInstantNs, RobotId, RobotState, SimulationTimeMs, ValidationError,
+    WorldPosition,
 };
 use crate::world::GridMap;
 use std::fmt;
@@ -189,6 +190,14 @@ impl<C: MonotonicClock> SimulationEngine<C> {
     /// Executes the fixed Phase 1 tick ordering and atomically commits at most one
     /// next robot state. Mutable access is the engine's single-writer boundary.
     pub fn step(&mut self, raw_action_index: i32) -> Result<StepRecord, EngineError> {
+        self.step_with_target(raw_action_index, None)
+    }
+
+    pub(crate) fn step_with_target(
+        &mut self,
+        raw_action_index: i32,
+        target: Option<WorldPosition>,
+    ) -> Result<StepRecord, EngineError> {
         let tick = self.tick;
         let simulation_time = self.simulation_time;
         let next_tick = tick.checked_next()?;
@@ -216,13 +225,14 @@ impl<C: MonotonicClock> SimulationEngine<C> {
 
         // 4-6. Candidate adaptation, deterministic safety, then motion preview.
         let adapted = ActionAdapter::from_index(raw_action_index);
-        let decision = self.safety.decide(
+        let decision = self.safety.decide_with_target(
             &self.map,
             self.state,
             adapted,
             self.config.motion_limits,
             applied_faults.active.actuator_effect(),
             emergency_stop_latched,
+            target,
         )?;
 
         // 7. Recheck the candidate independently. An invariant failure leaves all

@@ -214,6 +214,56 @@ pub fn preview_holonomic_motion(
     )
 }
 
+/// Position-controlled approach to one cardinal node center, ending at rest.
+/// Direction changes still brake on the existing axis before turning.
+pub fn preview_motion_to_target(
+    state: RobotState,
+    action: ActionCandidate,
+    target: WorldPosition,
+    limits: MotionLimits,
+    actuator: ActuatorEffect,
+) -> Result<MotionPreview, MotionError> {
+    let direction = action_vector(action);
+    let current = path_state(state, direction)?;
+    if action == ActionCandidate::Wait
+        || actuator.stuck()
+        || (current.velocity_mps > 0.0
+            && !direction_is_aligned((current.direction_x, current.direction_y), direction))
+    {
+        return preview_holonomic_motion(state, action, limits, actuator);
+    }
+    let dx = target.x_meters() - state.position().x_meters();
+    let dy = target.y_meters() - state.position().y_meters();
+    let distance = dx * direction.0 + dy * direction.1;
+    if distance < -SAFETY_EPSILON_METERS {
+        return Err(MotionError::InvalidInput);
+    }
+    let acceleration_limit = limits
+        .max_acceleration_mps2()
+        .min(limits.max_deceleration_mps2());
+    let mut input = ruckig_input(
+        current,
+        0.0,
+        acceleration_limit,
+        limits.max_jerk_mps3(),
+        limits,
+    )?;
+    input.control_interface = ControlInterface::Position;
+    input.target_position = vec![distance.max(0.0)];
+    input.max_velocity = vec![limits.max_linear_speed_mps() * actuator.speed_scale];
+    let mut output = OutputParameter::new_direct(1);
+    let mut ruckig = Ruckig::new_direct(1, CONTROL_TICK_SECONDS);
+    ensure_ruckig_success(ruckig.update(&mut input, &mut output))?;
+    preview_from_output(
+        state,
+        current,
+        &output,
+        acceleration_limit,
+        limits.max_jerk_mps3(),
+        limits.max_linear_speed_mps(),
+    )
+}
+
 pub fn preview_stop(
     state: RobotState,
     deceleration_mps2: f64,
@@ -317,6 +367,24 @@ fn preview_velocity_transition(
     let mut output = OutputParameter::new_direct(1);
     let mut ruckig = Ruckig::new_direct(1, CONTROL_TICK_SECONDS);
     ensure_ruckig_success(ruckig.update(&mut input, &mut output))?;
+    preview_from_output(
+        state,
+        current,
+        &output,
+        acceleration_limit_mps2,
+        jerk_limit_mps3,
+        max_linear_speed_mps,
+    )
+}
+
+fn preview_from_output(
+    state: RobotState,
+    current: PathState,
+    output: &OutputParameter,
+    acceleration_limit_mps2: f64,
+    jerk_limit_mps3: f64,
+    max_linear_speed_mps: f64,
+) -> Result<MotionPreview, MotionError> {
     validate_sample(
         &output.new_position,
         &output.new_velocity,
@@ -344,7 +412,7 @@ fn preview_velocity_transition(
     .map_err(|_| MotionError::InvalidOutput)?;
     let next = state.transitioned(position, velocity, acceleration);
     let swept_segments =
-        sampled_tick_segments(state.position(), current, &output, acceleration_limit_mps2)?;
+        sampled_tick_segments(state.position(), current, output, acceleration_limit_mps2)?;
     Ok(MotionPreview {
         previous: state,
         next,
@@ -532,6 +600,68 @@ mod tests {
     }
 
     #[test]
+    fn heading_follows_cardinal_velocity_and_is_retained_at_rest() {
+        for (x, y, heading) in [
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, std::f64::consts::FRAC_PI_2),
+            (-1.0, 0.0, std::f64::consts::PI),
+            (0.0, -1.0, -std::f64::consts::FRAC_PI_2),
+        ] {
+            let initial = state(Velocity::ZERO, Acceleration::ZERO);
+            let moving = initial.transitioned(
+                initial.position(),
+                Velocity::new(x, y).unwrap(),
+                Acceleration::ZERO,
+            );
+            assert_eq!(moving.yaw_radians(), heading);
+            let stopped =
+                moving.transitioned(moving.position(), Velocity::ZERO, Acceleration::ZERO);
+            assert_eq!(stopped.yaw_radians(), heading);
+        }
+    }
+
+    #[test]
+    fn position_control_reaches_and_stops_at_each_cardinal_center() {
+        let origin = WorldPosition::new(3.25, -2.75).unwrap();
+        for (dx, dy) in [(0.5, 0.0), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)] {
+            let target =
+                WorldPosition::new(origin.x_meters() + dx, origin.y_meters() + dy).unwrap();
+            let mut current =
+                RobotState::new(origin, Velocity::ZERO, Acceleration::ZERO, 0.0).unwrap();
+            for _ in 0..100 {
+                let action = crate::action::ActionAdapter::from_index(
+                    crate::route::action_toward_position(current.position(), target),
+                )
+                .candidate();
+                let preview = preview_motion_to_target(
+                    current,
+                    action,
+                    target,
+                    limits(),
+                    ActuatorEffect::nominal(),
+                )
+                .unwrap();
+                assert!(
+                    preview.next.velocity().magnitude() <= limits().max_linear_speed_mps() + 1.0e-8
+                );
+                assert!(
+                    preview.next.acceleration().magnitude()
+                        <= limits().max_acceleration_mps2() + 1.0e-8
+                );
+                let jerk = (preview.next.acceleration().x_mps2() - current.acceleration().x_mps2())
+                    .hypot(preview.next.acceleration().y_mps2() - current.acceleration().y_mps2())
+                    / CONTROL_TICK_SECONDS;
+                assert!(jerk <= limits().max_jerk_mps3() + 1.0e-8);
+                current = preview.next;
+            }
+            assert!((current.position().x_meters() - target.x_meters()).abs() < 1.0e-6);
+            assert!((current.position().y_meters() - target.y_meters()).abs() < 1.0e-6);
+            assert_eq!(current.velocity(), Velocity::ZERO);
+            assert_eq!(current.acceleration(), Acceleration::ZERO);
+        }
+    }
+
+    #[test]
     fn acceleration_is_jerk_limited() {
         let preview = preview_holonomic_motion(
             state(Velocity::ZERO, Acceleration::ZERO),
@@ -546,7 +676,7 @@ mod tests {
             preview.next.acceleration().magnitude() / CONTROL_TICK_SECONDS
                 <= limits().max_jerk_mps3() + 1.0e-12
         );
-        assert_eq!(preview.next.yaw_radians(), 0.25);
+        assert_eq!(preview.next.yaw_radians(), 0.0);
     }
 
     #[test]

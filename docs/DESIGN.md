@@ -621,7 +621,14 @@ Virtual robot state는 최소 다음 의미를 구분한다.
   현재 이동 방향을 1-DoF 경로축으로 투영하고 Ruckig의 position, velocity와 acceleration 출력을 world
   `x/y`로 변환한다. Desired cardinal velocity는 `maxLinearSpeedMps`를 넘지 않으며 방향이 바뀌면 기존
   경로축에서 velocity와 acceleration이 0에 도달한 다음 tick부터 새 방향으로 가속한다. Cardinal
-  action은 yaw를 바꾸지 않는다.
+  이동 중 yaw는 실제 velocity의 `atan2(vy, vx)`를 따르고, 정지 시 마지막 yaw를 유지한다.
+  이는 holonomic 모델의 이동 방향 표시이며 별도의 회전 actuator를 시뮬레이션하지 않는다.
+- Operational route follower는 셀 진입 여부 대신 `grid_to_world`의 노드 중심을 목표로 한다.
+  Ruckig position-control로 중심에서 velocity/acceleration이 0이 되도록 감속하며,
+  방향 전환 전에는 진입 축의 중심 정렬을 끝낸다. 작업 완료는 중심 거리 `1e-6 m` 이하,
+  속력 `1e-6 m/s` 미만과 가속도 크기 `1e-6 m/s²` 미만일 때만 판정한다.
+  Position-control preview에도 기존 swept-footprint, emergency stopping envelope,
+  fleet separation과 plan authorization 검사를 동일하게 적용한다.
 - `maxEmergencyDecelerationMps2 >= maxDecelerationMps2 > 0`과
   `maxEmergencyJerkMps3 >= maxJerkMps3 > 0`을 시작 시 검증한다. Controlled stop과 Emergency stop은
   각각의 감속·jerk limit로 Ruckig 궤적을 생성하며 정상 safety 경로에서 속도나 가속도를 즉시 0으로
@@ -1252,3 +1259,18 @@ Simulator는 server가 아직 지원하지 않는 contract로 먼저 message를 
 | Cross-repository test와 rollout | 19~21 | 16~18 |
 
 이 문서의 확정 기준선을 구현 편의를 위해 암묵적으로 변경하지 않는다. Public contract, safety boundary 또는 component 책임에 영향을 주는 변경은 ADR, 새 contract version, producer/consumer 영향 분석과 상위 아키텍처 및 Core 대응 설계 갱신을 먼저 수행한다.
+
+
+## Arrival actions (optional 1.1.0)
+
+Core owns station types and the optional `arrivalAction` command. Generated Core
+contracts provide action and phase enums. Simulator checkpoints load, battery,
+Order/action identity and elapsed simulation milliseconds before reporting results.
+Only safe stopped arrival begins PICK/PLACE/CHARGE; pause time is excluded.
+Completed actions retain identity across restart, retransmission and Order replanning.
+The operational default is 2000 ms per PICK/PLACE and 1 percentage point/s charging
+to 100%. Core releases the destination reservation only after accepted completion
+or its existing terminal stop procedure.
+
+Core-accepted completed Order identities are also retained in the durable spool,
+so a late command cannot replay a completed action after subsequent Orders or restart.

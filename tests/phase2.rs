@@ -96,6 +96,7 @@ fn command(epoch: u64, map: MapIdentity, command_id: Uuid, order_id: &str) -> Or
             map,
             goal: None,
             route: None,
+            arrival_action: None,
         },
     }
 }
@@ -299,7 +300,10 @@ fn accepted_completion_ack_clears_the_applied_order_checkpoint() {
     let mut session = session(&temp, map.clone(), Uuid::new_v4());
     synchronize(&mut session, 1, map.clone());
     session
-        .accept_order(&command(1, map, Uuid::new_v4(), "order-1"), NOW.to_owned())
+        .accept_order(
+            &command(1, map.clone(), Uuid::new_v4(), "order-1"),
+            NOW.to_owned(),
+        )
         .unwrap();
     session.queue_order_completed(500, NOW.to_owned()).unwrap();
     let completion = session.spool().pending().last().unwrap();
@@ -334,6 +338,23 @@ fn accepted_completion_ack_clears_the_applied_order_checkpoint() {
         AckResult::Removed
     );
     assert!(session.spool().applied_order().is_none());
+    assert!(session.spool().was_completed("order-1"));
+    let replay = session
+        .accept_order(
+            &command(1, map.clone(), Uuid::new_v4(), "order-1"),
+            NOW.to_owned(),
+        )
+        .unwrap();
+    assert!(!replay.apply_to_robot);
+    assert_eq!(replay.code, "ORDER_ALREADY_COMPLETED");
+    drop(session);
+    let mut restarted = self::session(&temp, map.clone(), Uuid::new_v4());
+    synchronize(&mut restarted, 2, map.clone());
+    let replay = restarted
+        .accept_order(&command(2, map, Uuid::new_v4(), "order-1"), NOW.to_owned())
+        .unwrap();
+    assert!(!replay.apply_to_robot);
+    assert_eq!(replay.code, "ORDER_ALREADY_COMPLETED");
 }
 
 #[test]
@@ -470,4 +491,25 @@ fn api_key_is_redacted_and_insecure_transport_is_loopback_local_only() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn compose_http_requires_explicit_opt_in_local_profile_and_exact_service() {
+    for (profile, host, port, enabled, accepted) in [
+        (RuntimeProfile::Local, "core", 8000, true, true),
+        (RuntimeProfile::Local, "core", 8000, false, false),
+        (RuntimeProfile::Dev, "core", 8000, true, false),
+        (RuntimeProfile::Local, "other", 8000, true, false),
+        (RuntimeProfile::Local, "core", 9000, true, false),
+    ] {
+        let result = CoreClientConfig::new_with_local_compose(
+            profile,
+            "sim-1".to_owned(),
+            Url::parse(&format!("http://{host}:{port}/")).unwrap(),
+            Url::parse(&format!("ws://{host}:{port}/ws/v1")).unwrap(),
+            ApiKey::new("01234567890123456789012345678901").unwrap(),
+            enabled,
+        );
+        assert_eq!(result.is_ok(), accepted);
+    }
 }

@@ -163,7 +163,7 @@ fn core_prepare_ack_and_activation_checkpoint_are_separate_and_timeout_is_fail_c
     let aborted = session
         .accept_order_at(&command, NOW.to_owned(), 102, true)
         .unwrap();
-    assert_eq!(aborted.code, "PLAN_ABORTED");
+    assert_eq!(aborted.code, "PLAN_ABORTED_STOPPED");
     assert!(session.applied_order().is_none());
 
     let timeout_temp = TempDir::new().unwrap();
@@ -331,6 +331,7 @@ fn plan_command(map: MapIdentity, plan_revision_id: Uuid, phase: OrderPhase) -> 
             map,
             goal: Some(OrderGoal { column: 1, row: 0 }),
             route: Some(route),
+            arrival_action: None,
         },
     }
 }
@@ -670,6 +671,7 @@ fn restart_does_not_reuse_a_spooled_plan_activation_as_motion_authority() {
                     plan_revision_id: Some(plan_revision_id),
                     goal: None,
                     route: None,
+                    arrival_action: None,
                 }),
             )
             .unwrap();
@@ -701,6 +703,10 @@ fn state_report(robot_id: &str, version: u64) -> ReportEnvelope {
             active_controller: controller(),
             order_id: None,
             order_update_id: None,
+            station_state: None,
+            station_actions_version: None,
+            operational_state: None,
+            safety: None,
         }),
     )
 }
@@ -756,4 +762,179 @@ fn controller() -> ActiveController {
 #[test]
 fn report_test_controller_contract_remains_baseline() {
     assert_eq!(controller().mode, ControllerMode::Baseline);
+}
+
+#[test]
+fn fractional_motion_checkpoint_roundtrip_preserves_checksum_and_pose() {
+    use mapf_rl_simulator::checkpoint::{RecoveryCheckpoint, RobotSafetyCheckpoint};
+    let temp = TempDir::new().unwrap();
+    let store = CheckpointStore::new(temp.path().join("safety.json")).unwrap();
+    let checkpoint = RecoveryCheckpoint {
+        simulator_id: "sim-1".to_owned(),
+        map_content_digest_sha256: "b".repeat(64),
+        robots: vec![RobotSafetyCheckpoint {
+            robot_id: "r1".to_owned(),
+            tick: 1,
+            simulation_time_ms: 100,
+            x_meters: 14.233333333333313,
+            y_meters: 8.299999999999992,
+            velocity_x_mps: 0.0,
+            velocity_y_mps: 0.0,
+            acceleration_x_mps2: 0.0,
+            acceleration_y_mps2: 0.0,
+            yaw_radians: 0.0,
+            emergency_stop_latched: false,
+        }],
+        plans: Default::default(),
+        no_progress_ticks: 0,
+        station_states: Default::default(),
+        requires_core_reconciliation: false,
+    };
+    use mapf_rl_simulator::contracts::generated::StationAction;
+    use mapf_rl_simulator::station::{StationConfig, StationState};
+    let mut station = StationState::default();
+    station.advance(
+        "pick-1",
+        StationAction::Pick,
+        true,
+        1000,
+        StationConfig::default(),
+    );
+    let checkpoint = checkpoint.with_station_state("r1".to_owned(), station.clone());
+    store.save(&checkpoint).unwrap();
+    let recovered = store
+        .load_for_restart("sim-1", &"b".repeat(64))
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.robots, checkpoint.robots);
+    let mut restored = recovered.station_states["r1"].clone();
+    assert_eq!(restored, station);
+    restored.advance(
+        "pick-1",
+        StationAction::Pick,
+        false,
+        5000,
+        StationConfig::default(),
+    );
+    assert!(!restored.loaded);
+    assert_eq!(restored.elapsed_ms, 1000);
+    restored.advance(
+        "pick-1",
+        StationAction::Pick,
+        true,
+        1000,
+        StationConfig::default(),
+    );
+    assert!(restored.loaded);
+    let completed = restored.clone();
+    restored.advance(
+        "pick-1",
+        StationAction::Pick,
+        true,
+        1000,
+        StationConfig::default(),
+    );
+    assert_eq!(restored, completed);
+    assert!(recovered.requires_core_reconciliation);
+}
+
+#[test]
+fn prepared_station_order_accepts_cancellation_and_fences_late_activation() {
+    use mapf_rl_simulator::contracts::generated::StationAction;
+
+    for action in [
+        StationAction::Pick,
+        StationAction::Place,
+        StationAction::Charge,
+    ] {
+        let temp = TempDir::new().unwrap();
+        let map = MapIdentity {
+            map_id: Uuid::new_v4(),
+            revision: 1,
+            content_digest_sha256: "d".repeat(64),
+        };
+        let mut session = synchronized_session(&temp, map.clone());
+        let mut command = plan_command(map, Uuid::new_v4(), OrderPhase::Prepare);
+        command.contract_version = "1.1.0".to_owned();
+        command.payload.arrival_action = Some(action);
+        assert_eq!(
+            session
+                .accept_order_at(&command, NOW.to_owned(), 100, true)
+                .unwrap()
+                .disposition,
+            CommandDisposition::Prepared
+        );
+        command.payload.goal = None;
+        command.payload.route = None;
+        command.payload.phase = OrderPhase::Abort;
+        command.payload.command_id = Uuid::new_v4();
+        let abort = session
+            .accept_order_at(&command, NOW.to_owned(), 101, true)
+            .unwrap();
+        assert_eq!(abort.disposition, CommandDisposition::Applied);
+        assert_eq!(abort.code, "PLAN_ABORTED_STOPPED");
+        assert!(session.prepared_order().is_none());
+        command.payload.phase = OrderPhase::Activate;
+        command.payload.command_id = Uuid::new_v4();
+        assert_eq!(
+            session
+                .accept_order_at(&command, NOW.to_owned(), 102, true)
+                .unwrap()
+                .code,
+            "ORDER_ABORTED"
+        );
+    }
+}
+
+#[test]
+fn cancellation_waits_for_stop_and_fences_late_activation() {
+    let temp = TempDir::new().unwrap();
+    let map = MapIdentity {
+        map_id: Uuid::new_v4(),
+        revision: 1,
+        content_digest_sha256: "d".repeat(64),
+    };
+    let mut session = synchronized_session(&temp, map.clone());
+    let mut command = plan_command(map, Uuid::new_v4(), OrderPhase::Prepare);
+    session
+        .accept_order_at(&command, NOW.to_owned(), 100, true)
+        .unwrap();
+    command.payload.phase = OrderPhase::Activate;
+    command.payload.command_id = Uuid::new_v4();
+    command.payload.goal = None;
+    command.payload.route = None;
+    session
+        .accept_order_at(&command, NOW.to_owned(), 101, true)
+        .unwrap();
+    let activation = command.clone();
+    command.payload.phase = OrderPhase::Abort;
+    command.payload.command_id = Uuid::new_v4();
+    let before = session.spool().pending().len();
+    let stopping = session
+        .accept_order_at(&command, NOW.to_owned(), 102, false)
+        .unwrap();
+    assert_eq!(stopping.code, "PLAN_ABORT_STOPPING");
+    assert_eq!(session.spool().pending().len(), before);
+    assert!(session.spool().pending_abort().is_some());
+    assert!(session.applied_order().is_some());
+    let stopped = session
+        .accept_order_at(&command, NOW.to_owned(), 103, true)
+        .unwrap();
+    assert_eq!(stopped.code, "PLAN_ABORTED_STOPPED");
+    assert!(session.spool().pending_abort().is_none());
+    assert!(session.applied_order().is_none());
+    assert_eq!(
+        session
+            .accept_order_at(&activation, NOW.to_owned(), 104, true)
+            .unwrap()
+            .code,
+        "ORDER_ABORTED"
+    );
+    assert_eq!(
+        session
+            .accept_order_at(&command, NOW.to_owned(), 105, true)
+            .unwrap()
+            .code,
+        "PLAN_ABORT_NOOP_STOPPED"
+    );
 }

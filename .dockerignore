@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!.env.example
+.venv
+node_modules
+target
+dist
+.local-demo
+.local-warehouse
+__pycache__
+.pytest_cache
+.ruff_cache

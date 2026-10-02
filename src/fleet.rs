@@ -3,7 +3,9 @@
 use crate::checkpoint::{RecoveryCheckpoint, RobotSafetyCheckpoint};
 use crate::plan::{PlanCoordinator, PlanError};
 use crate::simulation::{EngineError, MonotonicClock, SimulationEngine, StepRecord};
-use crate::types::{RobotId, RobotState, SAFETY_EPSILON_METERS, ValidationError, ensure_positive};
+use crate::types::{
+    RobotId, RobotState, SAFETY_EPSILON_METERS, ValidationError, WorldPosition, ensure_positive,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -131,6 +133,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
                 .collect(),
             plans,
             no_progress_ticks: self.no_progress_ticks,
+            station_states: BTreeMap::new(),
             requires_core_reconciliation: false,
         }
     }
@@ -194,6 +197,15 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         requested_actions: &BTreeMap<RobotId, i32>,
         plans: &mut PlanCoordinator,
     ) -> Result<FleetStep, FleetError> {
+        self.step_with_targets(requested_actions, &BTreeMap::new(), plans)
+    }
+
+    pub fn step_with_targets(
+        &mut self,
+        requested_actions: &BTreeMap<RobotId, i32>,
+        targets: &BTreeMap<RobotId, WorldPosition>,
+        plans: &mut PlanCoordinator,
+    ) -> Result<FleetStep, FleetError> {
         let reservations = plans.stationary_reservations();
         let mut actions = BTreeMap::new();
         for id in self.robots.keys() {
@@ -208,7 +220,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             );
         }
 
-        let initial = self.preview(&actions, false)?;
+        let initial = self.preview(&actions, targets, false)?;
         let conflicts = conflicting_pairs(
             &self.robots,
             &initial,
@@ -250,7 +262,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             });
         }
 
-        let mut next = self.preview(&actions, false)?;
+        let mut next = self.preview(&actions, targets, false)?;
         let remaining = conflicting_pairs(
             &self.robots,
             &next,
@@ -267,7 +279,8 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
                 .keys()
                 .map(|id| (id.clone(), 0))
                 .collect::<BTreeMap<_, _>>();
-            next = self.preview_selected_emergency(&emergency_actions, &involved)?;
+            next =
+                self.preview_selected_emergency(&emergency_actions, &BTreeMap::new(), &involved)?;
             if !conflicting_pairs(
                 &self.robots,
                 &next,
@@ -356,6 +369,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
     fn preview(
         &self,
         actions: &BTreeMap<RobotId, i32>,
+        targets: &BTreeMap<RobotId, WorldPosition>,
         emergency: bool,
     ) -> Result<BTreeMap<RobotId, (SimulationEngine<C>, StepRecord)>, FleetError> {
         let selected = if emergency {
@@ -363,12 +377,13 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         } else {
             BTreeSet::new()
         };
-        self.preview_selected_emergency(actions, &selected)
+        self.preview_selected_emergency(actions, targets, &selected)
     }
 
     fn preview_selected_emergency(
         &self,
         actions: &BTreeMap<RobotId, i32>,
+        targets: &BTreeMap<RobotId, WorldPosition>,
         emergency: &BTreeSet<RobotId>,
     ) -> Result<BTreeMap<RobotId, (SimulationEngine<C>, StepRecord)>, FleetError> {
         let mut previews = BTreeMap::new();
@@ -377,7 +392,10 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             if emergency.contains(id) {
                 clone.latch_emergency_stop();
             }
-            let record = clone.step(actions.get(id).copied().unwrap_or(0))?;
+            let record = clone.step_with_target(
+                actions.get(id).copied().unwrap_or(0),
+                targets.get(id).copied(),
+            )?;
             previews.insert(id.clone(), (clone, record));
         }
         Ok(previews)

@@ -2,7 +2,7 @@ use crate::action::AdaptedAction;
 use crate::contracts::generated::ActionCandidate;
 use crate::motion::{
     ActuatorEffect, MotionLimits, MotionPreview, SweptSegment, preview_holonomic_motion,
-    preview_stop, preview_stop_trajectory,
+    preview_motion_to_target, preview_stop, preview_stop_trajectory,
 };
 use crate::types::{
     CONTROL_TICK_SECONDS, Meters, RobotState, SAFETY_EPSILON_METERS, ValidationError,
@@ -145,6 +145,28 @@ impl SafetyKernel {
         actuator: ActuatorEffect,
         emergency_stop_latched: bool,
     ) -> Result<SafetyDecision, SafetyError> {
+        self.decide_with_target(
+            map,
+            state,
+            adapted,
+            motion_limits,
+            actuator,
+            emergency_stop_latched,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decide_with_target(
+        &self,
+        map: &GridMap,
+        state: RobotState,
+        adapted: AdaptedAction,
+        motion_limits: MotionLimits,
+        actuator: ActuatorEffect,
+        emergency_stop_latched: bool,
+        target: Option<WorldPosition>,
+    ) -> Result<SafetyDecision, SafetyError> {
         let requested = adapted.candidate();
         if emergency_stop_latched {
             return self.emergency_stop_decision(
@@ -175,19 +197,21 @@ impl SafetyKernel {
                 motion_limits,
             );
         }
-        let requested_preview =
-            match preview_holonomic_motion(state, requested, motion_limits, actuator) {
-                Ok(preview) => preview,
-                Err(_) => {
-                    return self.emergency_stop_decision(
-                        map,
-                        state,
-                        requested,
-                        SafetyReason::InvalidMotionState,
-                        motion_limits,
-                    );
-                }
-            };
+        let requested_preview = match target.map_or_else(
+            || preview_holonomic_motion(state, requested, motion_limits, actuator),
+            |target| preview_motion_to_target(state, requested, target, motion_limits, actuator),
+        ) {
+            Ok(preview) => preview,
+            Err(_) => {
+                return self.emergency_stop_decision(
+                    map,
+                    state,
+                    requested,
+                    SafetyReason::InvalidMotionState,
+                    motion_limits,
+                );
+            }
+        };
         if !kinematics_are_valid(&requested_preview, motion_limits) {
             return self.controlled_stop_decision(
                 map,
@@ -414,7 +438,12 @@ fn kinematics_are_valid(preview: &MotionPreview, limits: MotionLimits) -> bool {
         && next_acceleration.magnitude() <= acceleration_bound + SAFETY_EPSILON_METERS
         && acceleration_delta / CONTROL_TICK_SECONDS
             <= preview.jerk_limit_mps3 + SAFETY_EPSILON_METERS
-        && preview.previous.yaw_radians() == preview.next.yaw_radians()
+        && preview.next.yaw_radians()
+            == if next.magnitude() > 1.0e-9 {
+                next.y_mps().atan2(next.x_mps())
+            } else {
+                preview.previous.yaw_radians()
+            }
 }
 
 fn segment_aabb_distance_squared(

@@ -46,6 +46,8 @@ pub struct CoreSession {
     stream_id: Option<String>,
     last_stream_sequence: Option<u64>,
     next_state_report_ms: u64,
+    station_state: Option<crate::station::StationState>,
+    station_safe: bool,
     next_rest_fallback_ms: Option<u64>,
 }
 
@@ -75,6 +77,8 @@ impl CoreSession {
             stream_id: None,
             last_stream_sequence: None,
             next_state_report_ms: 0,
+            station_state: None,
+            station_safe: true,
             next_rest_fallback_ms: None,
         })
     }
@@ -215,7 +219,21 @@ impl CoreSession {
         if self.spool.expire_prepared_order(monotonic_ms)? {
             self.state = SessionState::Degraded;
         }
-        let decision = self.classify_order(command, stationary);
+        let mut decision = self.classify_order(command, stationary);
+        if command.payload.phase == OrderPhase::Abort
+            && decision.disposition != CommandDisposition::Rejected
+        {
+            self.spool.defer_abort(command.clone())?;
+            if !stationary {
+                decision.code = "PLAN_ABORT_STOPPING";
+                return Ok(decision);
+            }
+            decision.code = if decision.disposition == CommandDisposition::Duplicate {
+                "PLAN_ABORT_NOOP_STOPPED"
+            } else {
+                "PLAN_ABORTED_STOPPED"
+            };
+        }
         let applied_order = decision.apply_to_robot.then(|| {
             if command.payload.phase == OrderPhase::Activate
                 && command.payload.plan_revision_id.is_some()
@@ -228,6 +246,7 @@ impl CoreSession {
                     content_digest_sha256: prepared.content_digest_sha256.clone(),
                     plan_revision_id: Some(prepared.plan_revision_id),
                     goal: prepared.goal,
+                    arrival_action: prepared.arrival_action,
                     route: Some(
                         prepared
                             .route
@@ -243,6 +262,7 @@ impl CoreSession {
                     content_digest_sha256: command.payload.content_digest_sha256.clone(),
                     plan_revision_id: command.payload.plan_revision_id,
                     goal: command.payload.goal,
+                    arrival_action: command.payload.arrival_action,
                     route: command.payload.route.clone(),
                 }
             }
@@ -261,6 +281,7 @@ impl CoreSession {
                 prepared_at_monotonic_ms: monotonic_ms,
                 goal: command.payload.goal,
                 route: command.payload.route.clone(),
+                arrival_action: command.payload.arrival_action,
             });
         self.queue_command_ack(
             command,
@@ -293,6 +314,11 @@ impl CoreSession {
         true
     }
 
+    pub fn set_station_state(&mut self, state: crate::station::StationState, safe: bool) {
+        self.station_state = Some(state);
+        self.station_safe = safe;
+    }
+
     pub fn queue_state_report(
         &mut self,
         state_version: u64,
@@ -312,10 +338,39 @@ impl CoreSession {
             active_controller: self.controller.clone(),
             order_id: applied.map(|order| order.order_id.clone()),
             order_update_id: applied.map(|order| order.order_update_id),
+            station_actions_version: self.station_state.as_ref().map(|_| "1.1.0".to_owned()),
+            station_state: self.station_state.clone(),
+            operational_state: self.station_state.as_ref().map(|state| {
+                if !self.station_safe {
+                    "HELD"
+                } else if applied.is_some()
+                    && state.action == Some(crate::contracts::generated::StationAction::Charge)
+                    && state.phase == crate::station::StationPhase::Running
+                {
+                    "CHARGING"
+                } else if applied.is_some() {
+                    "EXECUTING"
+                } else {
+                    "IDLE"
+                }
+                .to_owned()
+            }),
+            safety: self.station_state.as_ref().map(|_| {
+                if self.station_safe {
+                    "NORMAL"
+                } else {
+                    "CONTROLLED_STOP"
+                }
+                .to_owned()
+            }),
         };
         let message_id = Uuid::new_v4();
         let report = ReportEnvelope {
-            contract_version: crate::contracts::generated::CONTRACT_VERSION.to_owned(),
+            contract_version: if self.station_state.is_some() {
+                "1.1.0".to_owned()
+            } else {
+                crate::contracts::generated::CONTRACT_VERSION.to_owned()
+            },
             message_id,
             message_type: "robot.state.report".to_owned(),
             producer: self.producer(),
@@ -348,6 +403,12 @@ impl CoreSession {
             .cloned()
             .ok_or(SessionError::NoAppliedOrder)?;
         let mut evidence = serde_json::Map::new();
+        if let Some(state) = &self.station_state {
+            evidence.insert(
+                "stationState".to_owned(),
+                serde_json::to_value(state).map_err(SpoolError::from)?,
+            );
+        }
         evidence.insert("orderId".to_owned(), applied.order_id.into());
         evidence.insert(
             "orderUpdateId".to_owned(),
@@ -476,6 +537,17 @@ impl CoreSession {
     }
 
     fn classify_order(&self, command: &OrderCommand, stationary: bool) -> OrderDecision {
+        if self.spool.was_completed(&command.payload.order_id) {
+            return rejected("ORDER_ALREADY_COMPLETED");
+        }
+        if command.payload.phase != OrderPhase::Abort
+            && (self.spool.pending_abort().is_some()
+                || self
+                    .spool
+                    .was_aborted(&command.payload.order_id, command.payload.order_update_id))
+        {
+            return rejected("ORDER_ABORTED");
+        }
         match command.payload.phase {
             OrderPhase::Prepare => return self.classify_prepare(command, stationary),
             OrderPhase::Abort => return self.classify_abort(command),
@@ -555,6 +627,16 @@ impl CoreSession {
     }
 
     fn classify_abort(&self, command: &OrderCommand) -> OrderDecision {
+        if self
+            .spool
+            .was_aborted(&command.payload.order_id, command.payload.order_update_id)
+        {
+            return OrderDecision {
+                apply_to_robot: false,
+                disposition: CommandDisposition::Duplicate,
+                code: "PLAN_ABORT_NOOP",
+            };
+        }
         if let Some(prepared) = self.spool.prepared_order() {
             if !prepared_matches_command(prepared, command) {
                 return rejected("PLAN_ABORT_IDENTITY_MISMATCH");
@@ -585,7 +667,8 @@ impl CoreSession {
         let current = self.spool.applied_order()?;
         (command.payload.order_id == current.order_id
             && command.payload.order_update_id == current.order_update_id
-            && command.payload.content_digest_sha256 == current.content_digest_sha256)
+            && command.payload.content_digest_sha256 == current.content_digest_sha256
+            && command.payload.arrival_action == current.arrival_action)
             .then_some(OrderDecision {
                 apply_to_robot: false,
                 disposition: CommandDisposition::Duplicate,
@@ -617,7 +700,9 @@ impl CoreSession {
             };
         }
         if command.payload.order_update_id == current.order_update_id {
-            return if command.payload.content_digest_sha256 == current.content_digest_sha256 {
+            return if command.payload.content_digest_sha256 == current.content_digest_sha256
+                && command.payload.arrival_action == current.arrival_action
+            {
                 OrderDecision {
                     apply_to_robot: false,
                     disposition: CommandDisposition::Duplicate,
@@ -694,7 +779,12 @@ impl CoreSession {
                 report,
                 applied_order.expect("classified activation"),
             )?;
-        } else if command.payload.phase == OrderPhase::Abort && decision.code == "PLAN_ABORTED" {
+        } else if command.payload.phase == OrderPhase::Abort
+            && matches!(
+                decision.code,
+                "PLAN_ABORTED_STOPPED" | "PLAN_ABORT_NOOP_STOPPED"
+            )
+        {
             self.spool.enqueue_aborting_prepared_order(report)?;
         } else {
             self.spool.enqueue_with_order(report, applied_order)?;
@@ -785,4 +875,5 @@ fn prepared_matches_command(prepared: &PreparedOrder, command: &OrderCommand) ->
         && command.payload.order_id == prepared.order_id
         && command.payload.order_update_id == prepared.order_update_id
         && command.payload.content_digest_sha256 == prepared.content_digest_sha256
+        && command.payload.arrival_action == prepared.arrival_action
 }

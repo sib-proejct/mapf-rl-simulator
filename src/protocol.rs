@@ -1,6 +1,5 @@
 //! Typed consumer boundary for the Core-owned contract `1.0.0`.
 
-use crate::contracts::generated::CONTRACT_VERSION;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
@@ -76,7 +75,7 @@ impl RasterMapContent {
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.identity().validate()?;
-        if self.contract_version != CONTRACT_VERSION
+        if !matches!(self.contract_version.as_str(), "1.0.0" | "1.1.0")
             || self.coordinate_frame.name != "map"
             || self.coordinate_frame.handedness != "RIGHT_HANDED"
             || self.coordinate_frame.x_axis != "EAST"
@@ -232,6 +231,8 @@ pub struct OrderCommandPayload {
     pub goal: Option<OrderGoal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<OrderRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrival_action: Option<crate::contracts::generated::StationAction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -277,6 +278,9 @@ impl OrderCommand {
             if route.robot_id != self.robot_id || route.order_id != self.payload.order_id {
                 return Err(ProtocolError::InvalidField("route binding"));
             }
+        }
+        if self.payload.arrival_action.is_some() && self.contract_version != "1.1.0" {
+            return Err(ProtocolError::ContractVersion);
         }
         self.payload.map.validate()
     }
@@ -336,6 +340,14 @@ pub struct RobotStatePayload {
     pub order_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_update_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub station_actions_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub station_state: Option<crate::station::StationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -407,7 +419,7 @@ pub struct ReportEnvelope {
 impl ReportEnvelope {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         ensure_timestamp(&self.occurred_at)?;
-        if self.contract_version != CONTRACT_VERSION {
+        if !matches!(self.contract_version.as_str(), "1.0.0" | "1.1.0") {
             return Err(ProtocolError::ContractVersion);
         }
         ensure_uuid_v4(self.message_id, "messageId")?;
@@ -433,6 +445,13 @@ impl ReportEnvelope {
                 }
                 if let Some(order_id) = &payload.order_id {
                     ensure_id(order_id, 128, "orderId")?;
+                }
+                if payload
+                    .station_state
+                    .as_ref()
+                    .is_some_and(|state| !state.valid())
+                {
+                    return Err(ProtocolError::InvalidField("station state"));
                 }
                 payload.pose.validate()?;
                 payload.active_controller.validate()
@@ -560,7 +579,7 @@ pub struct SimulatorSnapshot {
 
 impl SimulatorSnapshot {
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.contract_version != CONTRACT_VERSION || self.session_epoch == 0 {
+        if !matches!(self.contract_version.as_str(), "1.0.0" | "1.1.0") || self.session_epoch == 0 {
             return Err(ProtocolError::ContractVersion);
         }
         ensure_id(&self.simulator_id, 128, "simulatorId")?;
@@ -642,7 +661,7 @@ fn validate_core_envelope(
     producer: &Producer,
     correlation_id: Uuid,
 ) -> Result<(), ProtocolError> {
-    if contract_version != CONTRACT_VERSION {
+    if !matches!(contract_version, "1.0.0" | "1.1.0") {
         return Err(ProtocolError::ContractVersion);
     }
     ensure_uuid_v4(message_id, "messageId")?;
