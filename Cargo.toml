@@ -1,0 +1,25 @@
+[package]
+name = "mapf-rl-simulator"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Deterministic MAPF-RL virtual robot simulator"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+futures-util = "0.3"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ruckig = "=0.19.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"
