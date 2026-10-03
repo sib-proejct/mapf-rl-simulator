@@ -29,16 +29,21 @@ impl Drop for ChildGuard {
 
 #[tokio::test]
 async fn core_and_wave3_operational_simulator_complete_one_planned_route() {
-    run_scenario(false, false, BatteryScenario::Normal, false).await;
+    run_scenario(false, false, BatteryScenario::Normal, false, false).await;
 }
 #[tokio::test]
 async fn station_pick_place_and_charge_complete_after_arrival() {
-    run_scenario(true, false, BatteryScenario::Normal, false).await;
+    run_scenario(true, false, BatteryScenario::Normal, false, false).await;
 }
 #[tokio::test]
 async fn live_cancellation_stops_a_moving_robot() {
-    run_scenario(false, true, BatteryScenario::Normal, false).await;
+    run_scenario(false, true, BatteryScenario::Normal, false, false).await;
 }
+#[tokio::test]
+async fn queued_wave_runs_pick_place_pairs_on_the_same_robot() {
+    run_scenario(true, false, BatteryScenario::Normal, false, true).await;
+}
+
 // Each scenario drives wall-clock processes against simulation-time route windows.
 // Run them sequentially so competing local servers do not consume the prepare window.
 static OPERATIONAL_E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -52,17 +57,17 @@ enum BatteryScenario {
 
 #[tokio::test]
 async fn low_battery_finishes_work_then_automatically_travels_and_charges() {
-    run_scenario(true, false, BatteryScenario::AutoCharge, false).await;
+    run_scenario(true, false, BatteryScenario::AutoCharge, false, false).await;
 }
 
 #[tokio::test]
 async fn battery_depletion_stops_motion_and_reports_one_incident() {
-    run_scenario(true, false, BatteryScenario::Deplete, false).await;
+    run_scenario(true, false, BatteryScenario::Deplete, false, false).await;
 }
 
 #[tokio::test]
 async fn fleet_keeps_renewing_lease_and_provisions_a_robot() {
-    run_scenario(false, false, BatteryScenario::Normal, true).await;
+    run_scenario(false, false, BatteryScenario::Normal, true, false).await;
 }
 
 async fn run_scenario(
@@ -70,6 +75,7 @@ async fn run_scenario(
     cancellation: bool,
     battery: BatteryScenario,
     fleet_mode: bool,
+    queue_mode: bool,
 ) {
     let _guard = OPERATIONAL_E2E_LOCK.lock().await;
     let simulator_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -169,6 +175,68 @@ async fn run_scenario(
         .unwrap();
     let mut simulator = ChildGuard(simulator);
     wait_for_simulator_session(&client, &rest_base, &info.api_key).await;
+
+    if queue_mode {
+        let command = json!({
+            "requestId": Uuid::new_v4(), "mapId": info.map_id, "mapRevision": 1,
+            "tasks": [
+                {"robotId": "robot-1", "steps": [
+                    {"goalColumn": 3, "goalRow": 2, "arrivalAction": "PICK"},
+                    {"goalColumn": 4, "goalRow": 2, "arrivalAction": "PLACE"}]},
+                {"steps": [
+                    {"goalColumn": 3, "goalRow": 2, "arrivalAction": "PICK"},
+                    {"goalColumn": 4, "goalRow": 2, "arrivalAction": "PLACE"}]}
+            ]
+        });
+        let mut accepted = None;
+        for _ in 0..2 {
+            let response = client
+                .post(format!("{rest_base}api/v1/waves"))
+                .header("Cookie", "__Host-mapf_session=operator-session")
+                .header("X-CSRF-Token", "csrf-token")
+                .json(&command)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let outcome = response.json::<serde_json::Value>().await.unwrap();
+            if let Some(previous) = &accepted {
+                assert_eq!(previous, &outcome);
+            }
+            accepted = Some(outcome);
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let response = client
+                .get(format!("{rest_base}api/v1/queue/tasks"))
+                .header("Cookie", "__Host-mapf_session=operator-session")
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap();
+            let tasks = response["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 2);
+            if tasks.iter().all(|task| task["state"] == "Completed") {
+                for task in tasks {
+                    assert_eq!(task["robotId"], "robot-1");
+                    assert_eq!(task["stage"], 1);
+                    assert_eq!(task["orderIds"].as_array().unwrap().len(), 2);
+                }
+                assert_eq!(response["waves"][0]["counts"]["Completed"], 2);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Queued wave timed out: {response}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+        simulator.0.kill().unwrap();
+        core.0.kill().unwrap();
+        return;
+    }
 
     let steps = if station_actions && battery == BatteryScenario::Normal {
         vec![(3, Some("PICK")), (4, Some("PLACE")), (5, Some("CHARGE"))]
