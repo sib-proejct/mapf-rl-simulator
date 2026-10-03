@@ -28,6 +28,23 @@ pub struct IncidentReport {
 }
 
 impl Phase2Runtime {
+    /// Reconnect off the fleet tick. The shared durable session is held for motion
+    /// until the caller adopts the completed worker and its new socket.
+    pub fn reconnect_task(
+        &self,
+        monotonic_ms: u64,
+    ) -> tokio::task::JoinHandle<Result<Self, RuntimeError>> {
+        let mut worker = Self {
+            client: self.client.clone(),
+            session: Arc::clone(&self.session),
+            websocket: None,
+        };
+        tokio::spawn(async move {
+            worker.connect_and_replay(monotonic_ms).await?;
+            Ok(worker)
+        })
+    }
+
     pub fn new(client: CoreClient, session: CoreSession) -> Self {
         Self {
             client,
@@ -284,6 +301,39 @@ impl Phase2Runtime {
                 return Err(error.into());
             }
         };
+        self.accept_received(value, monotonic_ms, occurred_at, robot_is_stationary)
+            .await
+    }
+
+    /// Timeout only the cancellation-safe socket read, never durable message handling.
+    pub async fn poll_one_with_motion(
+        &mut self,
+        monotonic_ms: u64,
+        occurred_at: String,
+        robot_is_stationary: bool,
+    ) -> Result<Option<RuntimeEvent>, RuntimeError> {
+        let websocket = self.websocket.as_mut().ok_or(RuntimeError::Disconnected)?;
+        match websocket.poll_json().await {
+            Ok(None) => Ok(None),
+            Ok(Some(value)) => self
+                .accept_received(value, monotonic_ms, occurred_at, robot_is_stationary)
+                .await
+                .map(Some),
+            Err(error) => {
+                self.websocket = None;
+                self.mark_disconnected(monotonic_ms).await?;
+                Err(error.into())
+            }
+        }
+    }
+
+    async fn accept_received(
+        &mut self,
+        value: serde_json::Value,
+        monotonic_ms: u64,
+        occurred_at: String,
+        robot_is_stationary: bool,
+    ) -> Result<RuntimeEvent, RuntimeError> {
         let message_type = value
             .get("messageType")
             .and_then(serde_json::Value::as_str)
@@ -341,6 +391,14 @@ impl Phase2Runtime {
                         let stream = session.observe_stream_sequence(sequence);
                         if stream == StreamSequenceDisposition::Gap {
                             return Ok((stream, None));
+                        }
+                        if session
+                            .session_epoch()
+                            .is_some_and(|epoch| acknowledgement.session_epoch < epoch)
+                        {
+                            // A resumed stream can replay acknowledgements from a fenced session.
+                            // Their report remains spooled until a current-session ack or REST outcome.
+                            return Ok((stream, Some(crate::spool::AckResult::Unknown)));
                         }
                         let result = session.accept_report_ack(&acknowledgement)?;
                         Ok((stream, Some(result)))

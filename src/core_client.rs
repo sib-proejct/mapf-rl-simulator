@@ -103,6 +103,7 @@ pub struct CoreClient {
 impl CoreClient {
     pub fn new(config: CoreClientConfig) -> Result<Self, CoreClientError> {
         let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self { config, http })
@@ -183,7 +184,10 @@ impl CoreClient {
                     .map_err(|_| CoreClientError::InvalidResponse)?,
             );
         }
-        let (stream, response) = connect_async(request).await?;
+        let (stream, response) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), connect_async(request))
+                .await
+                .map_err(|_| CoreClientError::Timeout)??;
         let selected = response
             .headers()
             .get(SEC_WEBSOCKET_PROTOCOL)
@@ -208,11 +212,52 @@ impl CoreWebSocket {
         if encoded.len() > MAX_WS_MESSAGE_BYTES {
             return Err(CoreClientError::MessageTooLarge);
         }
-        self.stream.send(Message::Text(encoded.into())).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.stream.send(Message::Text(encoded.into())),
+        )
+        .await
+        .map_err(|_| CoreClientError::Timeout)??;
         Ok(())
     }
 
+    /// Only socket frame reads are cancellable. Ping/Pong writes must finish.
+    pub async fn poll_json(&mut self) -> Result<Option<serde_json::Value>, CoreClientError> {
+        let read =
+            tokio::time::timeout(std::time::Duration::from_millis(1), self.stream.next()).await;
+        let message = match read {
+            Err(_) => return Ok(None),
+            Ok(frame) => frame.ok_or(CoreClientError::Disconnected)??,
+        };
+        match message {
+            Message::Text(text) => {
+                if text.len() > MAX_WS_MESSAGE_BYTES {
+                    return Err(CoreClientError::MessageTooLarge);
+                }
+                Ok(Some(serde_json::from_str(text.as_str())?))
+            }
+            Message::Binary(_) => Err(CoreClientError::UnexpectedBinaryMessage),
+            Message::Ping(bytes) => {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    self.stream.send(Message::Pong(bytes)),
+                )
+                .await
+                .map_err(|_| CoreClientError::Timeout)??;
+                Ok(None)
+            }
+            Message::Pong(_) | Message::Frame(_) => Ok(None),
+            Message::Close(_) => Err(CoreClientError::Disconnected),
+        }
+    }
+
     pub async fn next_json(&mut self) -> Result<serde_json::Value, CoreClientError> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.next_json_inner())
+            .await
+            .map_err(|_| CoreClientError::Timeout)?
+    }
+
+    async fn next_json_inner(&mut self) -> Result<serde_json::Value, CoreClientError> {
         loop {
             let message = self
                 .stream
@@ -249,6 +294,7 @@ pub enum CoreClientError {
     Protocol(crate::protocol::ProtocolError),
     HttpStatus(StatusCode),
     Disconnected,
+    Timeout,
     InsecureTransport,
     InvalidApiKey,
     InvalidBatchSize,
@@ -299,6 +345,7 @@ impl fmt::Display for CoreClientError {
             Self::Protocol(error) => error.fmt(formatter),
             Self::HttpStatus(status) => write!(formatter, "Core returned HTTP {status}"),
             Self::Disconnected => formatter.write_str("Core WebSocket disconnected"),
+            Self::Timeout => formatter.write_str("Core WebSocket operation timed out"),
             Self::InsecureTransport => {
                 formatter.write_str("Core transport violates the selected profile")
             }

@@ -29,21 +29,48 @@ impl Drop for ChildGuard {
 
 #[tokio::test]
 async fn core_and_wave3_operational_simulator_complete_one_planned_route() {
-    run_scenario(false, false).await;
+    run_scenario(false, false, BatteryScenario::Normal, false).await;
 }
 #[tokio::test]
 async fn station_pick_place_and_charge_complete_after_arrival() {
-    run_scenario(true, false).await;
+    run_scenario(true, false, BatteryScenario::Normal, false).await;
 }
 #[tokio::test]
 async fn live_cancellation_stops_a_moving_robot() {
-    run_scenario(false, true).await;
+    run_scenario(false, true, BatteryScenario::Normal, false).await;
 }
 // Each scenario drives wall-clock processes against simulation-time route windows.
 // Run them sequentially so competing local servers do not consume the prepare window.
 static OPERATIONAL_E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn run_scenario(station_actions: bool, cancellation: bool) {
+#[derive(Clone, Copy, PartialEq)]
+enum BatteryScenario {
+    Normal,
+    AutoCharge,
+    Deplete,
+}
+
+#[tokio::test]
+async fn low_battery_finishes_work_then_automatically_travels_and_charges() {
+    run_scenario(true, false, BatteryScenario::AutoCharge, false).await;
+}
+
+#[tokio::test]
+async fn battery_depletion_stops_motion_and_reports_one_incident() {
+    run_scenario(true, false, BatteryScenario::Deplete, false).await;
+}
+
+#[tokio::test]
+async fn fleet_keeps_renewing_lease_and_provisions_a_robot() {
+    run_scenario(false, false, BatteryScenario::Normal, true).await;
+}
+
+async fn run_scenario(
+    station_actions: bool,
+    cancellation: bool,
+    battery: BatteryScenario,
+    fleet_mode: bool,
+) {
     let _guard = OPERATIONAL_E2E_LOCK.lock().await;
     let simulator_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let core_root = simulator_root.parent().unwrap().join("mapf-rl-core");
@@ -77,7 +104,14 @@ async fn run_scenario(station_actions: bool, cancellation: bool) {
     wait_for_core(&client, &rest_base).await;
 
     let simulator = Command::new(env!("CARGO_BIN_EXE_mapf-rl-simulator"))
-        .env("MAPF_SIMULATOR_MODE", "core")
+        .env(
+            "MAPF_SIMULATOR_MODE",
+            if fleet_mode { "fleet" } else { "core" },
+        )
+        .env(
+            "MAPF_SIMULATOR_RUNTIME_KEY_PATH",
+            temp.path().join("runtime-key"),
+        )
         .env("MAPF_PROFILE", "local")
         .env("MAPF_SIMULATOR_ID", "sim-1")
         .env("MAPF_SIMULATOR_ROBOT_ID", "robot-1")
@@ -105,7 +139,30 @@ async fn run_scenario(station_actions: bool, cancellation: bool) {
                 "true"
             },
         )
-        .env("MAPF_SIMULATOR_INITIAL_BATTERY_PERCENT", "99")
+        .env(
+            "MAPF_SIMULATOR_INITIAL_BATTERY_PERCENT",
+            if battery == BatteryScenario::Normal {
+                "99"
+            } else {
+                "21"
+            },
+        )
+        .env(
+            "MAPF_SIMULATOR_DRIVE_PERCENT_PER_METER",
+            match battery {
+                BatteryScenario::Normal => "0.1",
+                BatteryScenario::AutoCharge => "1",
+                BatteryScenario::Deplete => "100",
+            },
+        )
+        .env(
+            "MAPF_SIMULATOR_CHARGE_PERCENT_PER_SECOND",
+            if battery == BatteryScenario::AutoCharge {
+                "20"
+            } else {
+                "1"
+            },
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -113,7 +170,7 @@ async fn run_scenario(station_actions: bool, cancellation: bool) {
     let mut simulator = ChildGuard(simulator);
     wait_for_simulator_session(&client, &rest_base, &info.api_key).await;
 
-    let steps = if station_actions {
+    let steps = if station_actions && battery == BatteryScenario::Normal {
         vec![(3, Some("PICK")), (4, Some("PLACE")), (5, Some("CHARGE"))]
     } else {
         vec![(3, None)]
@@ -239,6 +296,42 @@ async fn run_scenario(station_actions: bool, cancellation: bool) {
                 sleep(Duration::from_millis(100)).await;
                 continue;
             }
+            if battery == BatteryScenario::Deplete {
+                let incidents: Vec<_> = snapshot["entities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|entity| {
+                        entity["entityType"] == "INCIDENT"
+                            && entity["data"]["code"] == "BATTERY_DEPLETED"
+                    })
+                    .collect();
+                if !incidents.is_empty() {
+                    assert_eq!(incidents.len(), 1);
+                    let checkpoint: serde_json::Value = serde_json::from_slice(
+                        &fs::read(temp.path().join("checkpoint.json")).unwrap(),
+                    )
+                    .unwrap();
+                    let robot = &checkpoint["body"]["checkpoint"]["robots"][0];
+                    if robot["velocityXMps"].as_f64().unwrap().abs() < 1e-6
+                        && robot["accelerationXMps2"].as_f64().unwrap().abs() < 1e-6
+                    {
+                        assert_eq!(
+                            checkpoint["body"]["checkpoint"]["stationStates"]["robot-1"]["batteryPercent"],
+                            0.0
+                        );
+                        assert!(robot["xMeters"].as_f64().unwrap() < 3.5);
+                        simulator.0.kill().unwrap();
+                        return;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Depletion did not stop: {snapshot}"
+                );
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             let completed = snapshot["entities"]
                 .as_array()
                 .unwrap()
@@ -272,7 +365,10 @@ async fn run_scenario(station_actions: bool, cancellation: bool) {
                     assert_eq!(state["phase"], "COMPLETED");
                     assert_eq!(state["loaded"], action == "PICK");
                     if action == "CHARGE" {
-                        assert_eq!(state["batteryPercent"], 100.0);
+                        // Core verifies exactly 100% in completion evidence. A later
+                        // idle state report may already include a tick of idle drain.
+                        let percent = state["batteryPercent"].as_f64().unwrap();
+                        assert!((99.99..=100.0).contains(&percent));
                     }
                 }
                 break;
@@ -284,7 +380,102 @@ async fn run_scenario(station_actions: bool, cancellation: bool) {
             sleep(Duration::from_millis(100)).await;
         }
     }
-    if station_actions {
+    if battery == BatteryScenario::AutoCharge {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let snapshot = client
+                .get(format!("{rest_base}api/v1/operations/snapshot"))
+                .header("Cookie", "__Host-mapf_session=operator-session")
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap();
+            let charge_complete = snapshot["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entity| {
+                    entity["entityType"] == "ORDER"
+                        && entity["data"]["state"] == "Completed"
+                        && entity["data"]["assignments"][0]["arrivalAction"] == "CHARGE"
+                });
+            if charge_complete {
+                let checkpoint: serde_json::Value =
+                    serde_json::from_slice(&fs::read(temp.path().join("checkpoint.json")).unwrap())
+                        .unwrap();
+                let station = &checkpoint["body"]["checkpoint"]["stationStates"]["robot-1"];
+                assert!(station["batteryPercent"].as_f64().unwrap() > 99.99);
+                assert_eq!(station["phase"], "COMPLETED");
+                let orders = snapshot["entities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["entityType"] == "ORDER")
+                    .count();
+                assert_eq!(orders, 2);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Auto charge did not complete: {snapshot}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+    if fleet_mode {
+        let created = client
+            .post(format!("{rest_base}api/v1/robots"))
+            .header("Cookie", "__Host-mapf_session=operator-session")
+            .header("X-CSRF-Token", "csrf-token")
+            .json(
+                &json!({"contractVersion": "1.0.0", "requestId": Uuid::new_v4(),
+                "map": {"mapId": info.map_id, "revision": 1,
+                    "contentDigestSha256": info.map_digest_sha256},
+                "start": {"column": 0, "row": 0}}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::ACCEPTED);
+        let created: serde_json::Value = created.json().await.unwrap();
+        let robot_id = created["robotId"].as_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status: serde_json::Value = client
+                .get(format!("{rest_base}api/v1/robots/{robot_id}/provisioning"))
+                .header("Cookie", "__Host-mapf_session=operator-session")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if status["state"] == "READY" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fleet robot never became READY: {status}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+        // Stay alive past the original lease/watchdog window.
+        sleep(Duration::from_secs(11)).await;
+        assert!(simulator.0.try_wait().unwrap().is_none());
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("fleet-checkpoint.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            checkpoint["body"]["checkpoint"]["robots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+    if station_actions || fleet_mode {
         simulator.0.kill().unwrap();
         return;
     }

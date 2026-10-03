@@ -65,14 +65,29 @@ pub struct RecoveryCheckpoint {
     pub map_content_digest_sha256: String,
     pub robots: Vec<RobotSafetyCheckpoint>,
     pub plans: PlanCoordinator,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub independent_plans: std::collections::BTreeMap<String, PlanCoordinator>,
     pub no_progress_ticks: u32,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub station_states: std::collections::BTreeMap<String, crate::station::StationState>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub battery_depletion_ids: std::collections::BTreeMap<String, uuid::Uuid>,
     /// Always true after a persisted checkpoint is loaded in a new process.
     pub requires_core_reconciliation: bool,
 }
 
 impl RecoveryCheckpoint {
+    pub fn with_battery_depletion(
+        mut self,
+        robot_id: String,
+        event_id: Option<uuid::Uuid>,
+    ) -> Self {
+        if let Some(event_id) = event_id {
+            self.battery_depletion_ids.insert(robot_id, event_id);
+        }
+        self
+    }
+
     pub fn with_station_state(
         mut self,
         robot_id: String,
@@ -94,6 +109,13 @@ impl RecoveryCheckpoint {
         if self.station_states.iter().any(|(id, state)| {
             !state.valid() || !self.robots.iter().any(|robot| &robot.robot_id == id)
         }) {
+            return Err(CheckpointError::Corrupt);
+        }
+        if self
+            .battery_depletion_ids
+            .keys()
+            .any(|id| !self.robots.iter().any(|robot| &robot.robot_id == id))
+        {
             return Err(CheckpointError::Corrupt);
         }
         let mut ids = std::collections::BTreeSet::new();
@@ -185,6 +207,9 @@ impl CheckpointStore {
         }
         checkpoint.requires_core_reconciliation = true;
         checkpoint.plans.fence_for_restart();
+        for plan in checkpoint.independent_plans.values_mut() {
+            plan.fence_for_restart();
+        }
         Ok(Some(checkpoint))
     }
 }

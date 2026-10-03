@@ -6,7 +6,8 @@ from pathlib import Path
 info = json.loads(Path("/run/mapf-demo/connection.json").read_text())
 os.environ.update({
     "MAPF_SIMULATOR_LOCAL_COMPOSE": "true",
-    "MAPF_SIMULATOR_MODE": "core", "MAPF_PROFILE": "local",
+    "MAPF_SIMULATOR_RUNTIME_KEY_PATH": "/run/mapf-demo/runtime-key",
+    "MAPF_SIMULATOR_MODE": "fleet", "MAPF_PROFILE": "local",
     "MAPF_SIMULATOR_ID": info["simulatorId"],
     "MAPF_SIMULATOR_ROBOT_ID": info["robotId"],
     "MAPF_SIMULATOR_API_KEY": info["apiKey"],

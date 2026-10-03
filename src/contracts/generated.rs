@@ -19,7 +19,7 @@ pub enum StationPhase {
 }
 pub const CONTRACT_VERSION: &str = "1.0.0";
 pub const CONTRACT_TREE_SHA256: &str =
-    "426957ca3ed3ba6d9f8c08697bd5921327c3b1082ffbc7356dea889772cbfd2f";
+    "178c6254cc51478ee3a1538109fa956abee013f5271aaaa22465a675f3a63db3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WsMessageType {

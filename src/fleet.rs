@@ -101,8 +101,33 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         &self.robots
     }
 
+    /// Virtual membership removal is allowed only between ticks at rest.
+    pub fn remove_stationary(&mut self, id: &RobotId) -> Result<bool, FleetError> {
+        let Some(robot) = self.robots.get(id) else {
+            return Ok(true);
+        };
+        if self.robots.len() == 1 {
+            return Err(FleetError::EmptyFleet);
+        }
+        if robot.state().velocity().magnitude() >= 1e-6
+            || robot.state().acceleration().magnitude() >= 1e-6
+        {
+            return Ok(false);
+        }
+        self.robots.remove(id);
+        self.no_progress_ticks = 0;
+        Ok(true)
+    }
+
     pub const fn no_progress_ticks(&self) -> u32 {
         self.no_progress_ticks
+    }
+
+    /// The next atomic fleet step validates emergency braking against every robot.
+    pub fn latch_robot_emergency_stop(&mut self, id: &RobotId) -> Result<(), FleetError> {
+        let robot = self.robots.get_mut(id).ok_or(FleetError::UnknownRobot)?;
+        robot.latch_emergency_stop();
+        Ok(())
     }
 
     pub fn checkpoint(
@@ -132,8 +157,10 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
                 })
                 .collect(),
             plans,
+            independent_plans: BTreeMap::new(),
             no_progress_ticks: self.no_progress_ticks,
             station_states: BTreeMap::new(),
+            battery_depletion_ids: BTreeMap::new(),
             requires_core_reconciliation: false,
         }
     }
@@ -206,18 +233,102 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         targets: &BTreeMap<RobotId, WorldPosition>,
         plans: &mut PlanCoordinator,
     ) -> Result<FleetStep, FleetError> {
-        let reservations = plans.stationary_reservations();
+        let authorized = self
+            .robots
+            .keys()
+            .filter(|id| plans.motion_authorized(id.as_str()))
+            .cloned()
+            .collect();
+        let step = self.step_authorized(requested_actions, targets, &authorized)?;
+        if step
+            .recovery
+            .as_ref()
+            .is_some_and(|event| event.replan_required)
+        {
+            plans.hold_for_recovery(None)?;
+        }
+        Ok(step)
+    }
+
+    /// Independent Core Orders share one atomic physical safety decision.
+    pub fn step_with_independent_plans(
+        &mut self,
+        requested_actions: &BTreeMap<RobotId, i32>,
+        targets: &BTreeMap<RobotId, WorldPosition>,
+        plans: &mut BTreeMap<RobotId, PlanCoordinator>,
+    ) -> Result<FleetStep, FleetError> {
+        let authorized = plans
+            .iter()
+            .filter(|(id, plan)| plan.motion_authorized(id.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let step = self.step_authorized(requested_actions, targets, &authorized)?;
+        if step
+            .recovery
+            .as_ref()
+            .is_some_and(|event| event.replan_required)
+        {
+            for plan in plans.values_mut() {
+                if plan.active_revision_id().is_some() {
+                    plan.hold_for_recovery(None)?;
+                }
+            }
+        }
+        Ok(step)
+    }
+
+    /// Called between fleet ticks, before the new robot receives motion authority.
+    pub fn insert(&mut self, engine: SimulationEngine<C>) -> Result<(), FleetError> {
+        let id = engine.robot_id().clone();
+        if self.robots.contains_key(&id) {
+            return Err(FleetError::DuplicateRobot);
+        }
+        validate_pairwise_states(
+            self.robots
+                .iter()
+                .map(|(id, engine)| (id, engine.state()))
+                .chain(std::iter::once((&id, engine.state()))),
+            self.config.minimum_center_separation_meters,
+        )?;
+        let candidate = Self::new(
+            self.robots
+                .values()
+                .cloned()
+                .chain(std::iter::once(engine.clone())),
+            self.config,
+        )?;
+        let actions = candidate.robots.keys().map(|id| (id.clone(), 0)).collect();
+        let preview = candidate.preview(&actions, &BTreeMap::new(), false)?;
+        if !conflicting_pairs(
+            &candidate.robots,
+            &preview,
+            self.config.minimum_center_separation_meters,
+            true,
+        )
+        .is_empty()
+        {
+            return Err(FleetError::CollisionInvariant);
+        }
+        self.robots.insert(id, engine);
+        Ok(())
+    }
+
+    fn step_authorized(
+        &mut self,
+        requested_actions: &BTreeMap<RobotId, i32>,
+        targets: &BTreeMap<RobotId, WorldPosition>,
+        authorized: &BTreeSet<RobotId>,
+    ) -> Result<FleetStep, FleetError> {
+        let reservations: BTreeSet<String> = self
+            .robots
+            .keys()
+            .filter(|id| !authorized.contains(*id))
+            .map(|id| id.as_str().to_owned())
+            .collect();
         let mut actions = BTreeMap::new();
         for id in self.robots.keys() {
             let action = requested_actions.get(id).copied().unwrap_or(0);
-            actions.insert(
-                id.clone(),
-                if plans.motion_authorized(id.as_str()) {
-                    action
-                } else {
-                    0
-                },
-            );
+            actions.insert(id.clone(), if authorized.contains(id) { action } else { 0 });
         }
 
         let initial = self.preview(&actions, targets, false)?;
@@ -300,7 +411,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
 
         let any_motion_requested = actions
             .iter()
-            .any(|(id, action)| *action != 0 && plans.motion_authorized(id.as_str()));
+            .any(|(id, action)| *action != 0 && authorized.contains(id));
         let made_progress = next.iter().any(|(id, (_, record))| {
             let previous = self.robots[id].state().position();
             let current = record.state.position();
@@ -314,7 +425,6 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             0
         };
         if self.no_progress_ticks >= self.config.deadlock_ticks {
-            plans.hold_for_recovery(None)?;
             recovery = Some(RecoveryEvent {
                 reason: RecoveryReason::Deadlock,
                 held_robots: self
@@ -324,12 +434,6 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
                     .collect(),
                 replan_required: true,
             });
-        }
-        if recovery
-            .as_ref()
-            .is_some_and(|event| event.replan_required && event.reason != RecoveryReason::Deadlock)
-        {
-            plans.hold_for_recovery(None)?;
         }
 
         let mut committed = BTreeMap::new();

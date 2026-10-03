@@ -13,7 +13,7 @@ scripts/smoke-test.sh
 최초 실행은 이미지를 빌드하고 PostgreSQL/Redis health → Core migration·seed → API/Planner →
 FE/Simulator 순서로 시작한다. 초기 빌드에는 네트워크 접근과 시간이 필요하다.
 `http://127.0.0.1:8000/local/login`을 열고 FE에서 **Live WS**를 선택한다.
-`warehouse-robot-1`이 준비되면 목표 **column 14, row 8**로 Order를 만든다.
+`r-001`이 준비되면 목표 **column 14, row 8**로 Order를 만든다.
 시작은 **column 4, row 2**이며 재시작 후에는 저장된 checkpoint를 복원한다.
 
 맵은 기본 Fixture 10Hz와 같은 **32×20, 1m/cell 창고**다. Core의
@@ -65,9 +65,19 @@ Core가 `ORDER_COMPLETED`를 수용한 ack를 보낸 경우에만 local applied-
 프로세스 재시작에서 active checkpoint가 복원되면 motion authority는 계속 fenced되고, 복원된 state를
 먼저 보고한 뒤 stable `SAFETY_RESTART_RECONCILIATION_REQUIRED` incident로 Core replan을 요청한다.
 
-현재 Core session credential은 한 operational robot을 bind하고 live API도 Order당 한 assignment로
-제한된다. Fleet engine은 운영 경로에 조합되어 있지만 per-target multi-assignment lifecycle이 추가되기
-전에는 여러 live robot의 동시 plan 실행을 지원 범위로 간주하지 않는다.
+각 Core session credential은 한 operational robot을 bind하고 live API도 Order당 한 assignment로
+제한된다. 로컬 Compose의 `MAPF_SIMULATOR_MODE=fleet`은 로봇별 session과 독립 plan을 하나의
+`MultiRobotEngine`에서 함께 실행한다. FE에서 생성한 로봇은 tick 경계에서 시작 위치와 정지 궤적을
+검사한 뒤 추가한다. 기존 `MAPF_SIMULATOR_MODE=core` 단일 로봇 실행 모드도 유지한다.
+
+Fleet 모드는 `MAPF_SIMULATOR_RUNTIME_KEY_PATH`의 별도 로컬 runtime credential을 사용한다.
+robot credential은 Core의 `robot-provisioning 1.0.0` claim 응답으로 받으며 FE에 노출하지 않는다.
+`fleet-checkpoint.json`은 모든 robot의 membership·물리 상태·plan·station 상태를 원자적으로 보존한다.
+WS 재접속은 물리 tick 밖에서 실행하며 로봇별 분산 지수 백오프(1초 이상, 최대 30초)를 적용한다.
+handshake·welcome 수신·socket 쓰기는 각각 3초 timeout을 사용한다. runtime lease 갱신은
+tick·초기화와 독립적으로 실행하며 마지막 성공 요청 시작부터 10초간 갱신되지 않으면 종료한다.
+기존 `checkpoint.json`과 `spool.json`은 삭제하지 않고 최초 fleet 전환에서 사용한다. Core migration
+`20261003_0007`을 먼저 적용해야 하며 운영 환경 자동 provisioning은 지원하지 않는다.
 
 공식 `ruckig` Rust crate는 upstream C++ 구현을 빌드하므로 Rust toolchain과 함께 C++20 compiler가
 필요하다. Motion capability는 speed, acceleration/deceleration과 정상·비상 jerk를 모두 명시한다.
@@ -121,3 +131,16 @@ Defaults: `MAPF_SIMULATOR_PICK_DURATION_MS=2000`,
 `MAPF_SIMULATOR_CHARGE_PERCENT_PER_SECOND=1` (percentage points/s),
 `MAPF_SIMULATOR_INITIAL_BATTERY_PERCENT=100` (used only without a restored checkpoint).
 Roll out compatible Core/migration first, then Simulator, then FE.
+
+
+## 배터리 및 자동 충전
+
+배터리 소모와 20% 이하 자동 충전을 지원한다. 진행 중인 작업은 완료한 뒤 충전하며 새 일반 작업은 제한한다. Core가 사용 가능한 충전소에 기존 CHARGE Order를 배정하고 Simulator가 100%까지 충전한다. 0%에서는 안전 정지하며 운영자 복구가 필요하다. 충전소가 없거나 점유 중이면 기다리고 재평가한다. 자세한 계약과 제한은 [Live WS 기능 현황](../mapf-rl-docs/LIVE-WS-CAPABILITIES.md#3-배터리-로직)을 참고한다.
+
+| 환경변수 | 기본값 | 단위 |
+|---|---|---|
+| `MAPF_SIMULATOR_DRIVE_PERCENT_PER_METER` | 0.1 | %p/m |
+| `MAPF_SIMULATOR_IDLE_PERCENT_PER_SECOND` | 0.001 | %p/s |
+| `MAPF_SIMULATOR_LOADED_BATTERY_MULTIPLIER` | 1.5 | 적재 주행 거리 소모 배율 |
+
+소모율은 유한한 0 이상 값, 적재 배율은 유한한 1 이상 값이어야 한다. 안전하게 충전하는 tick에는 소모하지 않는다. 초기 잔량·충전 속도 설정과 기존 checkpoint 우선 복원은 유지한다. 고갈 incident metadata가 있는 새 checkpoint는 이전 버전으로 downgrade할 때 호환되지 않으므로 원본을 보존한다.
