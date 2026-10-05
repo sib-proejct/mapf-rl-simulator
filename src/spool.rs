@@ -17,7 +17,7 @@ use uuid::Uuid;
 const SPOOL_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_REPORT_CAPACITY: usize = 10_000;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppliedOrder {
     pub command_id: Uuid,
@@ -34,7 +34,7 @@ pub struct AppliedOrder {
     pub arrival_action: Option<crate::contracts::generated::StationAction>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreparedOrder {
     pub command_id: Uuid,

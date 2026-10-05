@@ -43,7 +43,59 @@ impl Default for StationConfig {
         }
     }
 }
+/// Rates are percentage points per meter/second, using simulated time only.
+#[derive(Clone, Copy, Debug)]
+pub struct BatteryConfig {
+    pub drive_percent_per_meter: f64,
+    pub idle_percent_per_second: f64,
+    pub loaded_multiplier: f64,
+}
+impl Default for BatteryConfig {
+    fn default() -> Self {
+        Self {
+            drive_percent_per_meter: 0.1,
+            idle_percent_per_second: 0.001,
+            loaded_multiplier: 1.5,
+        }
+    }
+}
+impl BatteryConfig {
+    pub fn valid(self) -> bool {
+        [
+            self.drive_percent_per_meter,
+            self.idle_percent_per_second,
+            self.loaded_multiplier,
+        ]
+        .iter()
+        .all(|v| v.is_finite() && *v >= 0.0)
+            && self.loaded_multiplier >= 1.0
+    }
+}
+
 impl StationState {
+    pub fn consume_battery(
+        &mut self,
+        distance_meters: f64,
+        tick_ms: u64,
+        charging: bool,
+        config: BatteryConfig,
+    ) {
+        if charging {
+            return;
+        }
+        let multiplier = if self.loaded {
+            config.loaded_multiplier
+        } else {
+            1.0
+        };
+        let used = if distance_meters > 1e-9 {
+            distance_meters * config.drive_percent_per_meter * multiplier
+        } else {
+            tick_ms as f64 / 1000.0 * config.idle_percent_per_second
+        };
+        self.battery_percent = (self.battery_percent - used).clamp(0.0, 100.0);
+    }
+
     pub fn valid(&self) -> bool {
         self.battery_percent.is_finite()
             && (0.0..=100.0).contains(&self.battery_percent)
@@ -117,6 +169,52 @@ impl StationState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn battery_consumes_actual_distance_idle_time_and_loaded_multiplier() {
+        let mut state = StationState::default();
+        let config = BatteryConfig::default();
+        state.consume_battery(10.0, 100, false, config);
+        assert!((state.battery_percent - 99.0).abs() < 1e-9);
+        state.loaded = true;
+        state.consume_battery(10.0, 100, false, config);
+        assert!((state.battery_percent - 97.5).abs() < 1e-9);
+        state.consume_battery(0.0, 1000, false, config);
+        assert!((state.battery_percent - 97.499).abs() < 1e-9);
+        let before = state.battery_percent;
+        state.consume_battery(0.0, 5000, true, config);
+        assert_eq!(state.battery_percent, before);
+        state.consume_battery(10000.0, 100, false, config);
+        assert_eq!(state.battery_percent, 0.0);
+        assert!(state.valid());
+    }
+
+    #[test]
+    fn battery_configuration_rejects_invalid_rates() {
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(
+                !BatteryConfig {
+                    drive_percent_per_meter: invalid,
+                    ..Default::default()
+                }
+                .valid()
+            );
+            assert!(
+                !BatteryConfig {
+                    idle_percent_per_second: invalid,
+                    ..Default::default()
+                }
+                .valid()
+            );
+        }
+        assert!(
+            !BatteryConfig {
+                loaded_multiplier: 0.5,
+                ..Default::default()
+            }
+            .valid()
+        );
+    }
+
     #[test]
     fn pick_place_wait_for_safe_arrival_and_execute_once() {
         let mut state = StationState::default();

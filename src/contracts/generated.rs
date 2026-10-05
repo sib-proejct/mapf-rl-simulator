@@ -17,9 +17,10 @@ pub enum StationPhase {
     Completed,
     Failed,
 }
+pub const TELEMETRY_VERSION: &str = "1.0.0";
 pub const CONTRACT_VERSION: &str = "1.0.0";
 pub const CONTRACT_TREE_SHA256: &str =
-    "426957ca3ed3ba6d9f8c08697bd5921327c3b1082ffbc7356dea889772cbfd2f";
+    "920a0a733928e51abfcc111eb41b5aa70782c69e9a2140896cd89a1b696d79b0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WsMessageType {

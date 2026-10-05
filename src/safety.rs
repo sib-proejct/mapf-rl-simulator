@@ -1,8 +1,9 @@
 use crate::action::AdaptedAction;
 use crate::contracts::generated::ActionCandidate;
 use crate::motion::{
-    ActuatorEffect, MotionLimits, MotionPreview, SweptSegment, preview_holonomic_motion,
-    preview_motion_to_target, preview_stop, preview_stop_trajectory,
+    ActuatorEffect, MotionLimits, MotionPreview, MotionTarget, SweptSegment,
+    preview_holonomic_motion, preview_motion_to_route_target, preview_stop,
+    preview_stop_trajectory,
 };
 use crate::types::{
     CONTROL_TICK_SECONDS, Meters, RobotState, SAFETY_EPSILON_METERS, ValidationError,
@@ -165,7 +166,7 @@ impl SafetyKernel {
         motion_limits: MotionLimits,
         actuator: ActuatorEffect,
         emergency_stop_latched: bool,
-        target: Option<WorldPosition>,
+        target: Option<MotionTarget>,
     ) -> Result<SafetyDecision, SafetyError> {
         let requested = adapted.candidate();
         if emergency_stop_latched {
@@ -199,7 +200,9 @@ impl SafetyKernel {
         }
         let requested_preview = match target.map_or_else(
             || preview_holonomic_motion(state, requested, motion_limits, actuator),
-            |target| preview_motion_to_target(state, requested, target, motion_limits, actuator),
+            |target| {
+                preview_motion_to_route_target(state, requested, target, motion_limits, actuator)
+            },
         ) {
             Ok(preview) => preview,
             Err(_) => {

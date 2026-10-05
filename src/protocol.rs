@@ -179,18 +179,29 @@ pub struct OrderRouteWaypoint {
     pub end_simulation_time_ms: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrderRoute {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_control: Option<String>,
     pub robot_id: String,
     pub order_id: String,
     pub release_after_robot_id: Option<String>,
     pub plan_digest_sha256: String,
     pub waypoints: Vec<OrderRouteWaypoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<crate::contracts::provisioning_generated::MotionRoutePlan>,
 }
 
 impl OrderRoute {
     fn validate(&self) -> Result<(), ProtocolError> {
+        if self
+            .execution_control
+            .as_deref()
+            .is_some_and(|value| value != "occupancy-rights-v1")
+        {
+            return Err(ProtocolError::InvalidField("execution control"));
+        }
         ensure_id(&self.robot_id, 128, "route robotId")?;
         ensure_id(&self.order_id, 128, "route orderId")?;
         if let Some(robot_id) = &self.release_after_robot_id {
@@ -212,11 +223,61 @@ impl OrderRoute {
                 return Err(ProtocolError::InvalidField("route continuity"));
             }
         }
+        if let Some(motion) = &self.motion {
+            if motion.contract_version != "1.0.0"
+                || motion.profile_version == 0
+                || motion.limits.motion_limits().is_err()
+                || motion.segments.is_empty()
+            {
+                return Err(ProtocolError::InvalidField("motion route"));
+            }
+            let mut index = 0;
+            let mut end_time = self.waypoints[0].end_simulation_time_ms;
+            for segment in &motion.segments {
+                let start = self.waypoints[index];
+                if segment.start_column != u64::from(start.column)
+                    || segment.start_row != u64::from(start.row)
+                    || segment.start_simulation_time_ms != end_time
+                    || segment.end_simulation_time_ms <= end_time
+                {
+                    return Err(ProtocolError::InvalidField("motion segment continuity"));
+                }
+                let dx = segment.end_column as i128 - segment.start_column as i128;
+                let dy = segment.end_row as i128 - segment.start_row as i128;
+                if (dx == 0) == (dy == 0) {
+                    return Err(ProtocolError::InvalidField("motion segment direction"));
+                }
+                while u64::from(self.waypoints[index].column) != segment.end_column
+                    || u64::from(self.waypoints[index].row) != segment.end_row
+                {
+                    let previous = self.waypoints[index];
+                    index += 1;
+                    let next = self
+                        .waypoints
+                        .get(index)
+                        .ok_or(ProtocolError::InvalidField("motion segment endpoint"))?;
+                    if (
+                        i128::from(next.column) - i128::from(previous.column),
+                        i128::from(next.row) - i128::from(previous.row),
+                    ) != (dx.signum(), dy.signum())
+                    {
+                        return Err(ProtocolError::InvalidField("motion segment path"));
+                    }
+                }
+                end_time = segment.end_simulation_time_ms;
+                if self.waypoints[index].end_simulation_time_ms != end_time {
+                    return Err(ProtocolError::InvalidField("motion segment timing"));
+                }
+            }
+            if index + 1 != self.waypoints.len() {
+                return Err(ProtocolError::InvalidField("motion route coverage"));
+            }
+        }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrderCommandPayload {
     pub command_id: Uuid,
@@ -235,7 +296,7 @@ pub struct OrderCommandPayload {
     pub arrival_action: Option<crate::contracts::generated::StationAction>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrderCommand {
     pub contract_version: String,
@@ -332,6 +393,8 @@ impl PoseReport {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RobotStatePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_wait: Option<Box<crate::contracts::provisioning_generated::TrafficWait>>,
     pub state_version: u64,
     pub simulation_time_ms: i64,
     pub pose: PoseReport,

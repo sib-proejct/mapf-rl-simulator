@@ -1,12 +1,11 @@
 use crate::action::ActionAdapter;
 use crate::contracts::generated::ActionCandidate;
 use crate::fault::{FaultInjector, FaultSpec, ScheduledFault};
-use crate::motion::{MotionLimits, initial_kinematics_are_valid};
+use crate::motion::{MotionLimits, MotionTarget, initial_kinematics_are_valid};
 use crate::safety::{SafetyError, SafetyKernel, SafetyOutcome, SafetyReason};
 use crate::sensing::{SeededSensor, SensorConfig, SensorReading};
 use crate::types::{
     ControlTick, MonotonicInstantNs, RobotId, RobotState, SimulationTimeMs, ValidationError,
-    WorldPosition,
 };
 use crate::world::GridMap;
 use std::fmt;
@@ -151,6 +150,35 @@ impl<C: MonotonicClock> SimulationEngine<C> {
         &self.map
     }
 
+    pub fn motion_limits(&self) -> MotionLimits {
+        self.config.motion_limits
+    }
+
+    pub fn footprint_radius_meters(&self) -> f64 {
+        self.config.safety.footprint_radius_meters()
+    }
+
+    /// Configuration changes are committed only at rest and through safety validation.
+    pub(crate) fn apply_motion_limits(
+        &mut self,
+        limits: MotionLimits,
+    ) -> Result<bool, EngineError> {
+        if self.state.velocity().magnitude() >= 1e-6
+            || self.state.acceleration().magnitude() >= 1e-6
+        {
+            return Ok(false);
+        }
+        if !initial_kinematics_are_valid(self.state, limits)
+            || !self
+                .safety
+                .state_has_safe_emergency_stop(&self.map, self.state, limits)
+        {
+            return Err(EngineError::CollisionInvariant);
+        }
+        self.config.motion_limits = limits;
+        Ok(true)
+    }
+
     pub const fn emergency_stop_latched(&self) -> bool {
         self.emergency_stop_latched
     }
@@ -196,7 +224,7 @@ impl<C: MonotonicClock> SimulationEngine<C> {
     pub(crate) fn step_with_target(
         &mut self,
         raw_action_index: i32,
-        target: Option<WorldPosition>,
+        target: Option<MotionTarget>,
     ) -> Result<StepRecord, EngineError> {
         let tick = self.tick;
         let simulation_time = self.simulation_time;
@@ -489,5 +517,41 @@ mod tests {
             );
             assert!(matches!(result, Err(EngineError::InvalidInitialKinematics)));
         }
+    }
+    #[test]
+    fn motion_profile_updates_wait_for_full_rest() {
+        let map = GridMap::new(20, 3, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, []).unwrap();
+        let original = MotionLimits::new(1.0, 2.0, 3.0, 6.0, 30.0, 60.0).unwrap();
+        let updated = MotionLimits::new(1.5, 1.0, 1.5, 6.0, 3.0, 60.0).unwrap();
+        let mut engine = SimulationEngine::new(
+            ManualMonotonicClock::default(),
+            RobotId::new("r1").unwrap(),
+            map,
+            RobotState::new(
+                WorldPosition::new(0.5, 1.5).unwrap(),
+                Velocity::ZERO,
+                Acceleration::ZERO,
+                0.0,
+            )
+            .unwrap(),
+            EngineConfig {
+                motion_limits: original,
+                safety: SafetyConfig::new(0.2, 0.05).unwrap(),
+                sensor: SensorConfig::new(0.0, 0).unwrap(),
+            },
+            1,
+            &[],
+        )
+        .unwrap();
+        for _ in 0..10 {
+            engine.step(2).unwrap();
+        }
+        assert!(!engine.apply_motion_limits(updated).unwrap());
+        assert_eq!(engine.motion_limits(), original);
+        for _ in 0..30 {
+            engine.step(0).unwrap();
+        }
+        assert!(engine.apply_motion_limits(updated).unwrap());
+        assert_eq!(engine.motion_limits(), updated);
     }
 }

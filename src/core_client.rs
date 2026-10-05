@@ -103,9 +103,80 @@ pub struct CoreClient {
 impl CoreClient {
     pub fn new(config: CoreClientConfig) -> Result<Self, CoreClientError> {
         let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self { config, http })
+    }
+
+    pub async fn telemetry_supported(&self) -> Result<bool, CoreClientError> {
+        let response = self
+            .http
+            .get(self.config.rest_base_url.join("api/v1/capabilities")?)
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        require_success(response.status())?;
+        let value: serde_json::Value = response.json().await?;
+        match value["telemetry"]["supported"].as_bool() {
+            Some(false) => Ok(false),
+            Some(true) if value["telemetry"]["version"] == "1.0.0" => Ok(true),
+            _ => Err(CoreClientError::InvalidResponse),
+        }
+    }
+
+    pub async fn require_occupancy_control(&self) -> Result<(), CoreClientError> {
+        let response = self
+            .http
+            .get(self.config.rest_base_url.join("api/v1/capabilities")?)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    CoreClientError::Timeout
+                } else {
+                    error.into()
+                }
+            })?;
+        require_success(response.status())?;
+        let value: serde_json::Value = response.json().await?;
+        let control = &value["executionControl"];
+        if control["supported"] != true
+            || control["version"] != "1.0.0"
+            || control["mode"] != "occupancy-rights-v1"
+            || control["timing"] != "ESTIMATE_ONLY"
+        {
+            return Err(CoreClientError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    pub async fn connect_telemetry(&self) -> Result<CoreWebSocket, CoreClientError> {
+        let mut url = self.config.websocket_url.clone();
+        url.set_path("/ws/v1/telemetry");
+        let mut request = url.as_str().into_client_request()?;
+        request
+            .headers_mut()
+            .insert(API_KEY_HEADER, self.config.api_key.0.clone());
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("mapf.telemetry.v1"),
+        );
+        let (stream, response) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), connect_async(request))
+                .await
+                .map_err(|_| CoreClientError::Timeout)??;
+        if response
+            .headers()
+            .get(SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|v| v.to_str().ok())
+            != Some("mapf.telemetry.v1")
+        {
+            return Err(CoreClientError::SubprotocolMismatch);
+        }
+        Ok(CoreWebSocket { stream })
     }
 
     pub async fn fetch_snapshot(&self) -> Result<SimulatorSnapshot, CoreClientError> {
@@ -169,6 +240,10 @@ impl CoreClient {
         resume_after: Option<u64>,
     ) -> Result<CoreWebSocket, CoreClientError> {
         let mut request = self.config.websocket_url.as_str().into_client_request()?;
+        request.headers_mut().insert(
+            "x-mapf-execution-control",
+            HeaderValue::from_static("occupancy-rights-v1"),
+        );
         request
             .headers_mut()
             .insert(API_KEY_HEADER, self.config.api_key.0.clone());
@@ -183,7 +258,10 @@ impl CoreClient {
                     .map_err(|_| CoreClientError::InvalidResponse)?,
             );
         }
-        let (stream, response) = connect_async(request).await?;
+        let (stream, response) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), connect_async(request))
+                .await
+                .map_err(|_| CoreClientError::Timeout)??;
         let selected = response
             .headers()
             .get(SEC_WEBSOCKET_PROTOCOL)
@@ -200,6 +278,20 @@ pub struct CoreWebSocket {
 }
 
 impl CoreWebSocket {
+    pub async fn send_json(&mut self, value: &serde_json::Value) -> Result<(), CoreClientError> {
+        let encoded = serde_json::to_string(value)?;
+        if encoded.len() > MAX_WS_MESSAGE_BYTES {
+            return Err(CoreClientError::MessageTooLarge);
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.stream.send(Message::Text(encoded.into())),
+        )
+        .await
+        .map_err(|_| CoreClientError::Timeout)??;
+        Ok(())
+    }
+
     /// A successful return only means bytes reached the WebSocket. The caller must
     /// retain the report until the matching Core `report.ack` is processed.
     pub async fn write_report(&mut self, report: &ReportEnvelope) -> Result<(), CoreClientError> {
@@ -208,11 +300,52 @@ impl CoreWebSocket {
         if encoded.len() > MAX_WS_MESSAGE_BYTES {
             return Err(CoreClientError::MessageTooLarge);
         }
-        self.stream.send(Message::Text(encoded.into())).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.stream.send(Message::Text(encoded.into())),
+        )
+        .await
+        .map_err(|_| CoreClientError::Timeout)??;
         Ok(())
     }
 
+    /// Only socket frame reads are cancellable. Ping/Pong writes must finish.
+    pub async fn poll_json(&mut self) -> Result<Option<serde_json::Value>, CoreClientError> {
+        let read =
+            tokio::time::timeout(std::time::Duration::from_millis(1), self.stream.next()).await;
+        let message = match read {
+            Err(_) => return Ok(None),
+            Ok(frame) => frame.ok_or(CoreClientError::Disconnected)??,
+        };
+        match message {
+            Message::Text(text) => {
+                if text.len() > MAX_WS_MESSAGE_BYTES {
+                    return Err(CoreClientError::MessageTooLarge);
+                }
+                Ok(Some(serde_json::from_str(text.as_str())?))
+            }
+            Message::Binary(_) => Err(CoreClientError::UnexpectedBinaryMessage),
+            Message::Ping(bytes) => {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    self.stream.send(Message::Pong(bytes)),
+                )
+                .await
+                .map_err(|_| CoreClientError::Timeout)??;
+                Ok(None)
+            }
+            Message::Pong(_) | Message::Frame(_) => Ok(None),
+            Message::Close(_) => Err(CoreClientError::Disconnected),
+        }
+    }
+
     pub async fn next_json(&mut self) -> Result<serde_json::Value, CoreClientError> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.next_json_inner())
+            .await
+            .map_err(|_| CoreClientError::Timeout)?
+    }
+
+    async fn next_json_inner(&mut self) -> Result<serde_json::Value, CoreClientError> {
         loop {
             let message = self
                 .stream
@@ -249,6 +382,7 @@ pub enum CoreClientError {
     Protocol(crate::protocol::ProtocolError),
     HttpStatus(StatusCode),
     Disconnected,
+    Timeout,
     InsecureTransport,
     InvalidApiKey,
     InvalidBatchSize,
@@ -299,6 +433,7 @@ impl fmt::Display for CoreClientError {
             Self::Protocol(error) => error.fmt(formatter),
             Self::HttpStatus(status) => write!(formatter, "Core returned HTTP {status}"),
             Self::Disconnected => formatter.write_str("Core WebSocket disconnected"),
+            Self::Timeout => formatter.write_str("Core WebSocket operation timed out"),
             Self::InsecureTransport => {
                 formatter.write_str("Core transport violates the selected profile")
             }

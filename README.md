@@ -12,8 +12,8 @@ scripts/smoke-test.sh
 
 최초 실행은 이미지를 빌드하고 PostgreSQL/Redis health → Core migration·seed → API/Planner →
 FE/Simulator 순서로 시작한다. 초기 빌드에는 네트워크 접근과 시간이 필요하다.
-`http://127.0.0.1:8000/local/login`을 열고 FE에서 **Live WS**를 선택한다.
-`warehouse-robot-1`이 준비되면 목표 **column 14, row 8**로 Order를 만든다.
+`http://127.0.0.1:8001/local/login`을 열고 FE에서 **Live WS**를 선택한다.
+`r-001`이 준비되면 목표 **column 14, row 8**로 Order를 만든다.
 시작은 **column 4, row 2**이며 재시작 후에는 저장된 checkpoint를 복원한다.
 
 맵은 기본 Fixture 10Hz와 같은 **32×20, 1m/cell 창고**다. Core의
@@ -50,7 +50,7 @@ scenario를 `CollisionInvariant`로 종료한다.
 
 Phase 2는 Core contract `1.0.0`의 authenticated REST/WS client, durable session fencing과
 process-global report spool, single Order 멱등 적용, application ack/execution report 분리,
-10 Hz state fast path, reconnect/replay와 5초 REST recovery를 제공한다. Baseline controller는
+5 Hz (200 ms) state fast path, reconnect/replay와 5초 REST recovery를 제공한다. Baseline controller는
 `local`/`dev`에서만 명시적으로 선택되며 identity와 digest가 모든 state report에 포함된다.
 WS write만으로 report를 제거하지 않고 matching `report.ack` 또는 REST batch outcome의
 `ACCEPTED`/`DUPLICATE`를 확인한 뒤 제거한다.
@@ -65,9 +65,19 @@ Core가 `ORDER_COMPLETED`를 수용한 ack를 보낸 경우에만 local applied-
 프로세스 재시작에서 active checkpoint가 복원되면 motion authority는 계속 fenced되고, 복원된 state를
 먼저 보고한 뒤 stable `SAFETY_RESTART_RECONCILIATION_REQUIRED` incident로 Core replan을 요청한다.
 
-현재 Core session credential은 한 operational robot을 bind하고 live API도 Order당 한 assignment로
-제한된다. Fleet engine은 운영 경로에 조합되어 있지만 per-target multi-assignment lifecycle이 추가되기
-전에는 여러 live robot의 동시 plan 실행을 지원 범위로 간주하지 않는다.
+각 Core session credential은 한 operational robot을 bind하고 live API도 Order당 한 assignment로
+제한된다. 로컬 Compose의 `MAPF_SIMULATOR_MODE=fleet`은 로봇별 session과 독립 plan을 하나의
+`MultiRobotEngine`에서 함께 실행한다. FE에서 생성한 로봇은 tick 경계에서 시작 위치와 정지 궤적을
+검사한 뒤 추가한다. 기존 `MAPF_SIMULATOR_MODE=core` 단일 로봇 실행 모드도 유지한다.
+
+Fleet 모드는 `MAPF_SIMULATOR_RUNTIME_KEY_PATH`의 별도 로컬 runtime credential을 사용한다.
+robot credential은 Core의 `robot-provisioning 1.0.0` claim 응답으로 받으며 FE에 노출하지 않는다.
+`fleet-checkpoint.json`은 모든 robot의 membership·물리 상태·plan·station 상태를 원자적으로 보존한다.
+WS 재접속은 물리 tick 밖에서 실행하며 로봇별 분산 지수 백오프(1초 이상, 최대 30초)를 적용한다.
+handshake·welcome 수신·socket 쓰기는 각각 3초 timeout을 사용한다. runtime lease 갱신은
+tick·초기화와 독립적으로 실행하며 마지막 성공 요청 시작부터 10초간 갱신되지 않으면 종료한다.
+기존 `checkpoint.json`과 `spool.json`은 삭제하지 않고 최초 fleet 전환에서 사용한다. Core migration
+`20261003_0007`을 먼저 적용해야 하며 운영 환경 자동 provisioning은 지원하지 않는다.
 
 공식 `ruckig` Rust crate는 upstream C++ 구현을 빌드하므로 Rust toolchain과 함께 C++20 compiler가
 필요하다. Motion capability는 speed, acceleration/deceleration과 정상·비상 jerk를 모두 명시한다.
@@ -121,3 +131,66 @@ Defaults: `MAPF_SIMULATOR_PICK_DURATION_MS=2000`,
 `MAPF_SIMULATOR_CHARGE_PERCENT_PER_SECOND=1` (percentage points/s),
 `MAPF_SIMULATOR_INITIAL_BATTERY_PERCENT=100` (used only without a restored checkpoint).
 Roll out compatible Core/migration first, then Simulator, then FE.
+
+
+## 배터리 및 자동 충전
+
+배터리 소모와 20% 이하 자동 충전을 지원한다. 진행 중인 작업은 완료한 뒤 충전하며 새 일반 작업은 제한한다. Core가 사용 가능한 충전소에 기존 CHARGE Order를 배정하고 Simulator가 100%까지 충전한다. 0%에서는 안전 정지하며 운영자 복구가 필요하다. 충전소가 없거나 점유 중이면 기다리고 재평가한다. 자세한 계약과 제한은 [Live WS 기능 현황](../mapf-rl-docs/LIVE-WS-CAPABILITIES.md#3-배터리-로직)을 참고한다.
+
+| 환경변수 | 기본값 | 단위 |
+|---|---|---|
+| `MAPF_SIMULATOR_DRIVE_PERCENT_PER_METER` | 0.1 | %p/m |
+| `MAPF_SIMULATOR_IDLE_PERCENT_PER_SECOND` | 0.001 | %p/s |
+| `MAPF_SIMULATOR_LOADED_BATTERY_MULTIPLIER` | 1.5 | 적재 주행 거리 소모 배율 |
+
+소모율은 유한한 0 이상 값, 적재 배율은 유한한 1 이상 값이어야 한다. 안전하게 충전하는 tick에는 소모하지 않는다. 초기 잔량·충전 속도 설정과 기존 checkpoint 우선 복원은 유지한다. 고갈 incident metadata가 있는 새 checkpoint는 이전 버전으로 downgrade할 때 호환되지 않으므로 원본을 보존한다.
+
+일반 상태 보고는 단일 로봇과 fleet 모두 200 ms 간격이며 물리 시뮬레이션과 안전 검사는 100 ms 간격을 유지한다. 명령 ACK·오류·완료·취소는 주기 제한 없이 전송한다. 완료와 정지 후 취소 ACK 전에 최신 상태를 먼저 보고하며, 같은 tick에 이미 보고했다면 중복 생성하지 않는다. 지연된 tick은 보고를 몰아서 생성하지 않는다. `stateVersion`은 물리 tick 기준이고 `reportSequence`는 실제 메시지 생성 기준이다.
+
+
+### 일반 상태 telemetry
+
+Core 소유 `telemetry 1.0.0` 계약과 `/ws/v1/telemetry` (`mapf.telemetry.v1`)를
+`GET /api/v1/capabilities`로 협상한다. 일반 위치·배터리 보고는 200ms, 물리·안전 tick은
+100ms다. 일반 보고는 별도 `telemetrySequence`, Redis TTL 15초, `PROJECTION` ACK를 사용하고
+PostgreSQL 기록과 durable spool을 만들지 않는다. Redis 유실 후 최신 Simulator 보고로 복구한다.
+주문·완료·취소·안전·station 전이는 선행 durable 상태 보고와 기존 ACK/spool을 유지한다.
+telemetry 연결 단절 또는 3초 ACK 부재는 Simulator hold를 유발하며 최신 ACK와 기존 안전
+조건 확인 후 재개한다. FE는 두 순번을 독립 관리하고 연결 유실 시 stale·snapshot 복구를 한다.
+미지원 Core는 legacy DB 보고 경로를 사용하며 Redis 장애는 자동 fallback 사유가 아니다.
+일반 상태 DB sampling은 없다. 이전 이미지·저장 볼륨은 배포와 rollback 시 보존한다.
+
+### PLACE departure buffers
+
+Core assigns post-PLACE buffer moves through the existing ordinary order protocol.
+Simulator retains deterministic safety authority. Operational E2E verifies physical
+buffer arrival after PLACE; `tests/buffer_clearance.rs` checks all 12 canonical berths
+with the other 11 occupied, in both directions and with deterministic replay.
+
+### Occupancy passage rights
+
+Operational default control requires Core's `executionControl` capability
+`occupancy-rights-v1` / `1.0.0` / `ESTIMATE_ONLY`. Route progress follows physical
+position. On ordinary straight runs, `PassageRights` atomically reserves the next
+physical tick plus jerk-limited ordinary/emergency stopping trajectories, including
+footprint, minimum separation and interpolation margins. Moving grants can extend;
+rear cells release each tick only after the complete safety footprint and braking
+envelope clear them. Following robots can depart before the leader stops, with
+conservative cell-level spacing. A denied extension causes braking inside the
+retained envelope. Changed targets wait for a full stop. Degree-2 narrow corridors
+remain exclusive through both exits, including physical occupancy reconstruction.
+Cancellation/disconnect preserve braking resources; emergency stops retain the
+emergency profile. Rights never expire by time. Longer-horizon collision predictions
+also yield with `trafficWait` before the unchanged safety kernel runs.
+Normal waits report `trafficWait` and resume automatically; only cyclic waits
+request Core replanning. Cycle detection includes waits added by the longer-horizon
+forecast, and excludes robots that merely queue behind a cycle. The existing physical
+prediction and collision kernel
+still checks every committed fleet tick. Policy inference is unchanged.
+
+Focused regression scenarios: `cargo test --test passage_rights` (late estimates,
+crossing, concurrent following and deterministic replay, weak-brake follower with
+leader emergency stop, target-change braking, corridor exits/head-on deadlock,
+forecast wait-cycle recovery,
+cancellation/disconnect braking), plus `cargo test traffic --lib` (atomic contention,
+rolling release/extension and FIFO) and `cargo test passage --lib` (rear clearance).
