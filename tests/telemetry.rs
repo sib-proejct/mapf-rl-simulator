@@ -108,3 +108,62 @@ fn ordinary_pose_battery_progress_are_volatile_but_transitions_are_durable() {
     moved["stationState"]["phase"] = json!("COMPLETED");
     assert_ne!(durable_fingerprint(&initial), durable_fingerprint(&moved));
 }
+
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn ping_during_publication_and_invalid_ack_fail_closed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (ping_tx, ping_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket =
+            tokio_tungstenite::accept_hdr_async(stream, |_: &Request, mut response: Response| {
+                response.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    "mapf.telemetry.v1".parse().unwrap(),
+                );
+                Ok(response)
+            })
+            .await
+            .unwrap();
+        let first = socket.next().await.unwrap().unwrap();
+        let value: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+        assert_eq!(value["telemetrySequence"], 1);
+        socket
+            .send(Message::Ping(vec![1, 2, 3].into()))
+            .await
+            .unwrap();
+        ping_tx.send(()).unwrap();
+        let mut pong = false;
+        let mut report = false;
+        while !pong || !report {
+            match socket.next().await.unwrap().unwrap() {
+                Message::Pong(bytes) => {
+                    assert_eq!(bytes.as_ref(), &[1, 2, 3]);
+                    pong = true;
+                }
+                Message::Text(text) => {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(value["telemetrySequence"], 2);
+                    report = true;
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        let mut invalid = frame(2);
+        invalid["sessionEpoch"] = json!(999);
+        socket.send(ack(invalid)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .is_ok()
+        );
+    });
+    let transport = TelemetryTransport::start(client(port));
+    transport.publish(frame(1));
+    ping_rx.await.unwrap();
+    transport.publish(frame(2));
+    server.await.unwrap();
+    assert!(!transport.ready());
+}

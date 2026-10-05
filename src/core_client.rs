@@ -317,6 +317,22 @@ impl CoreWebSocket {
             Err(_) => return Ok(None),
             Ok(frame) => frame.ok_or(CoreClientError::Disconnected)??,
         };
+        self.handle_frame(message).await
+    }
+
+    /// Cancellation-safe read only; callers must complete handle_frame outside select!.
+    pub(crate) async fn read_frame(&mut self) -> Result<Message, CoreClientError> {
+        self.stream
+            .next()
+            .await
+            .ok_or(CoreClientError::Disconnected)?
+            .map_err(CoreClientError::from)
+    }
+
+    pub(crate) async fn handle_frame(
+        &mut self,
+        message: Message,
+    ) -> Result<Option<serde_json::Value>, CoreClientError> {
         match message {
             Message::Text(text) => {
                 if text.len() > MAX_WS_MESSAGE_BYTES {

@@ -1320,7 +1320,6 @@ async fn run_fleet(
                 robot.disconnect(monotonic_ms).await?;
             }
         }
-        persist(&fleet, &robots, &store, &base).await?;
     }
 }
 

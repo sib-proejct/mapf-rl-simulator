@@ -810,6 +810,26 @@ fn fractional_motion_checkpoint_roundtrip_preserves_checksum_and_pose() {
     );
     let checkpoint = checkpoint.with_station_state("r1".to_owned(), station.clone());
     store.save(&checkpoint).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let path = temp.path().join("safety.json");
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        store.clone().save(&checkpoint).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let mut changed = checkpoint.clone();
+        changed.robots[0].tick += 1;
+        changed.robots[0].simulation_time_ms += 100;
+        store.save(&changed).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+        // A failed replacement must not become the cached successful state.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(store.save(&checkpoint).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        store.save(&checkpoint).unwrap();
+        assert!(path.is_file());
+    }
     let recovered = store
         .load_for_restart("sim-1", &"b".repeat(64))
         .unwrap()

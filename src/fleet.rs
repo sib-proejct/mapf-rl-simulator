@@ -773,6 +773,7 @@ fn conflicting_pairs<C: MonotonicClock + Clone>(
 ) -> Vec<(RobotId, RobotId)> {
     let ids: Vec<_> = current.keys().collect();
     let mut conflicts = Vec::new();
+    let mut forecasts = BTreeMap::new();
     for (index, left) in ids.iter().enumerate() {
         for right in ids.iter().skip(index + 1) {
             let transition_distance = simultaneous_segment_distance_squared(
@@ -789,13 +790,18 @@ fn conflicting_pairs<C: MonotonicClock + Clone>(
                     2.0,
                 );
                 if targets.contains_key(*left) || targets.contains_key(*right) {
+                    for id in [*left, *right] {
+                        forecasts.entry(id).or_insert_with(|| {
+                            targeted_prediction(
+                                &next[id].0,
+                                actions.get(id).copied().unwrap_or(0),
+                                targets.get(id).copied(),
+                            )
+                        });
+                    }
                     targeted_prediction_distance_squared(
-                        &next[*left].0,
-                        &next[*right].0,
-                        actions.get(*left).copied().unwrap_or(0),
-                        actions.get(*right).copied().unwrap_or(0),
-                        targets.get(*left).copied(),
-                        targets.get(*right).copied(),
+                        forecasts[*left].as_deref(),
+                        forecasts[*right].as_deref(),
                     )
                 } else {
                     straight
@@ -856,12 +862,25 @@ fn passage_motion_resources<C: MonotonicClock + Clone>(
     let next = record.state;
     let limits = engine.motion_limits();
     // Bound interpolation between the endpoints of the actual next tick.
-    let margin = limits
-        .max_acceleration_mps2()
-        .max(limits.max_deceleration_mps2())
-        .max(limits.max_emergency_deceleration_mps2())
-        * crate::types::CONTROL_TICK_SECONDS.powi(2)
-        / 8.0;
+    let current = engine.state();
+    let stationary = current.position() == next.position()
+        && current.velocity().magnitude() == 0.0
+        && current.acceleration().magnitude() == 0.0
+        && next.velocity().magnitude() == 0.0
+        && next.acceleration().magnitude() == 0.0;
+    // A truly stationary WAIT has no swept-trajectory interpolation error.
+    // Padding it with maximum emergency acceleration can claim an empty neighbor
+    // cell forever and create a false wait cycle between safely separated robots.
+    let margin = if stationary {
+        0.0
+    } else {
+        limits
+            .max_acceleration_mps2()
+            .max(limits.max_deceleration_mps2())
+            .max(limits.max_emergency_deceleration_mps2())
+            * crate::types::CONTROL_TICK_SECONDS.powi(2)
+            / 8.0
+    };
     let mut resources = passage_segment_resources(
         engine.map(),
         engine.state().position(),
@@ -905,34 +924,33 @@ fn passage_motion_resources<C: MonotonicClock + Clone>(
 // The endpoint is the next required stop, possibly beyond intermediate straight nodes.
 // Replay the same deterministic target controller over the existing 2s horizon,
 // checking every swept tick. A failed forecast is treated as a conflict.
-fn targeted_prediction_distance_squared<C: MonotonicClock + Clone>(
-    left: &SimulationEngine<C>,
-    right: &SimulationEngine<C>,
-    left_action: i32,
-    right_action: i32,
-    left_target: Option<MotionTarget>,
-    right_target: Option<MotionTarget>,
-) -> f64 {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    let mut distance = f64::INFINITY;
+fn targeted_prediction<C: MonotonicClock + Clone>(
+    engine: &SimulationEngine<C>,
+    action: i32,
+    target: Option<MotionTarget>,
+) -> Option<Vec<RobotState>> {
+    let mut engine = engine.clone();
+    let mut states = Vec::with_capacity(21);
+    states.push(engine.state());
     for _ in 0..20 {
-        let left_start = left.state();
-        let right_start = right.state();
-        let (Ok(left_next), Ok(right_next)) = (
-            left.step_with_target(left_action, left_target),
-            right.step_with_target(right_action, right_target),
-        ) else {
-            return 0.0;
-        };
-        distance = distance.min(simultaneous_segment_distance_squared(
-            left_start,
-            left_next.state,
-            right_start,
-            right_next.state,
-        ));
+        states.push(engine.step_with_target(action, target).ok()?.state);
     }
-    distance
+    Some(states)
+}
+
+fn targeted_prediction_distance_squared(
+    left: Option<&[RobotState]>,
+    right: Option<&[RobotState]>,
+) -> f64 {
+    let (Some(left), Some(right)) = (left, right) else {
+        return 0.0;
+    };
+    left.windows(2)
+        .zip(right.windows(2))
+        .map(|(left, right)| {
+            simultaneous_segment_distance_squared(left[0], left[1], right[0], right[1])
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 fn constant_velocity_distance_squared(
@@ -1098,6 +1116,154 @@ impl std::error::Error for FleetError {}
 #[cfg(test)]
 mod passage_tests {
     use super::*;
+    #[test]
+    fn stationary_braking_resources_match_observed_footprint() {
+        use crate::simulation::{EngineConfig, ManualMonotonicClock};
+        use crate::types::{Acceleration, Velocity};
+        let map =
+            crate::world::GridMap::new(32, 20, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, [])
+                .unwrap();
+        let position = WorldPosition::new(13.5, 3.2551316701949484).unwrap();
+        let engine = SimulationEngine::new(
+            ManualMonotonicClock::default(),
+            RobotId::new("r-010").unwrap(),
+            map.clone(),
+            RobotState::new(position, Velocity::ZERO, Acceleration::ZERO, 0.0).unwrap(),
+            EngineConfig {
+                motion_limits: crate::motion::MotionLimits::new(1.5, 1.0, 1.5, 6.0, 3.0, 60.0)
+                    .unwrap(),
+                safety: crate::safety::SafetyConfig::new(0.2, 0.05).unwrap(),
+                sensor: crate::sensing::SensorConfig::new(0.0, 0).unwrap(),
+            },
+            7,
+            &[],
+        )
+        .unwrap();
+        let observed = passage_segment_resources(&map, position, position, 0.25);
+        let (retained, emergency) = passage_motion_resources(&engine, 0, None, 0.25).unwrap();
+        assert!(!emergency);
+        assert!(!observed.contains(&(13, 2)));
+        assert_eq!(retained, observed);
+    }
+
+    #[test]
+    fn shared_forecasts_match_pairwise_replay() {
+        use crate::simulation::{EngineConfig, ManualMonotonicClock};
+        use crate::types::{Acceleration, Velocity};
+        let mut robots = BTreeMap::new();
+        let mut actions = BTreeMap::new();
+        let mut targets = BTreeMap::new();
+        for index in 0..8 {
+            let id = RobotId::new(format!("r{index}")).unwrap();
+            let y = 2.5 + f64::from(index);
+            let engine = SimulationEngine::new(
+                ManualMonotonicClock::default(),
+                id.clone(),
+                crate::world::GridMap::new(20, 12, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, [])
+                    .unwrap(),
+                RobotState::new(
+                    WorldPosition::new(2.5, y).unwrap(),
+                    Velocity::ZERO,
+                    Acceleration::ZERO,
+                    0.0,
+                )
+                .unwrap(),
+                EngineConfig {
+                    motion_limits: crate::motion::MotionLimits::new(1.0, 2.0, 3.0, 6.0, 30.0, 60.0)
+                        .unwrap(),
+                    safety: crate::safety::SafetyConfig::new(0.2, 0.05).unwrap(),
+                    sensor: crate::sensing::SensorConfig::new(0.0, 0).unwrap(),
+                },
+                7,
+                &[],
+            )
+            .unwrap();
+            robots.insert(id.clone(), engine);
+            actions.insert(id.clone(), 1);
+            // Include mixed targeted and untargeted pairs.
+            if index % 2 == 0 {
+                targets.insert(id, WorldPosition::new(8.5, y).unwrap().into());
+            }
+        }
+        let next: BTreeMap<_, _> = robots
+            .iter()
+            .map(|(id, engine)| {
+                let mut engine = engine.clone();
+                let record = engine
+                    .step_with_target(actions[id], targets.get(id).copied())
+                    .unwrap();
+                (id.clone(), (engine, record))
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let mut expected = Vec::new();
+        let ids: Vec<_> = robots.keys().collect();
+        for (index, left) in ids.iter().enumerate() {
+            for right in ids.iter().skip(index + 1) {
+                let mut left_engine = next[*left].0.clone();
+                let mut right_engine = next[*right].0.clone();
+                let mut distance = constant_velocity_distance_squared(
+                    next[*left].1.state,
+                    next[*right].1.state,
+                    2.0,
+                );
+                if targets.contains_key(*left) || targets.contains_key(*right) {
+                    distance = f64::INFINITY;
+                    for _ in 0..20 {
+                        let left_start = left_engine.state();
+                        let right_start = right_engine.state();
+                        match (
+                            left_engine
+                                .step_with_target(actions[*left], targets.get(*left).copied()),
+                            right_engine
+                                .step_with_target(actions[*right], targets.get(*right).copied()),
+                        ) {
+                            (Ok(left_next), Ok(right_next)) => {
+                                distance = distance.min(simultaneous_segment_distance_squared(
+                                    left_start,
+                                    left_next.state,
+                                    right_start,
+                                    right_next.state,
+                                ))
+                            }
+                            _ => {
+                                distance = 0.0;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let transition = simultaneous_segment_distance_squared(
+                    robots[*left].state(),
+                    next[*left].1.state,
+                    robots[*right].state(),
+                    next[*right].1.state,
+                );
+                if transition.min(distance) < (1.1 + SAFETY_EPSILON_METERS).powi(2) {
+                    expected.push(((*left).clone(), (*right).clone()));
+                }
+            }
+        }
+        let pairwise_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let actual = conflicting_pairs(
+            &robots,
+            &next,
+            1.1,
+            Some(MotionPrediction {
+                actions: &actions,
+                targets: &targets,
+            }),
+        );
+        eprintln!(
+            "pairwise={pairwise_elapsed:?}, shared={:?}",
+            started.elapsed()
+        );
+        assert!(!expected.is_empty());
+        assert_eq!(actual, expected);
+        assert_eq!(targeted_prediction_distance_squared(None, None), 0.0);
+    }
+
     #[test]
     fn rear_cell_stays_until_entire_safety_footprint_clears() {
         let map = crate::world::GridMap::new(9, 7, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, [])
