@@ -195,10 +195,12 @@ fn core_prepare_ack_and_activation_checkpoint_are_separate_and_timeout_is_fail_c
 fn prepared_route_follower_waits_for_timestamp_then_moves_to_next_waypoint() {
     let map = GridMap::new(3, 1, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, []).unwrap();
     let route = OrderRoute {
+        execution_control: None,
         robot_id: "r1".to_owned(),
         order_id: "order-r1".to_owned(),
         release_after_robot_id: None,
         plan_digest_sha256: "f".repeat(64),
+        motion: None,
         waypoints: vec![
             OrderRouteWaypoint {
                 column: 0,
@@ -288,10 +290,12 @@ fn synchronized_session(temp: &TempDir, map: MapIdentity) -> CoreSession {
 
 fn plan_command(map: MapIdentity, plan_revision_id: Uuid, phase: OrderPhase) -> OrderCommand {
     let route = OrderRoute {
+        execution_control: None,
         robot_id: "r1".to_owned(),
         order_id: "order-r1".to_owned(),
         release_after_robot_id: None,
         plan_digest_sha256: "f".repeat(64),
+        motion: None,
         waypoints: vec![
             OrderRouteWaypoint {
                 column: 0,
@@ -693,6 +697,7 @@ fn state_report(robot_id: &str, version: u64) -> ReportEnvelope {
         "robot.state.report",
         None,
         ReportPayload::State(RobotStatePayload {
+            traffic_wait: None,
             state_version: version,
             simulation_time_ms: version as i64 * 100,
             pose: PoseReport {
@@ -790,6 +795,7 @@ fn fractional_motion_checkpoint_roundtrip_preserves_checksum_and_pose() {
         no_progress_ticks: 0,
         station_states: Default::default(),
         battery_depletion_ids: Default::default(),
+        motion_profiles: Default::default(),
         requires_core_reconciliation: false,
     };
     use mapf_rl_simulator::contracts::generated::StationAction;
@@ -1042,8 +1048,12 @@ fn independent_orders_crossing_are_held_before_collision_and_idle_robot_is_reser
         })
         .expect("crossing independently authorized robots must be held");
     assert_eq!(recovery.reason, RecoveryReason::Collision);
-    assert!(!plans[&r1].motion_authorized("r1"));
-    assert!(!plans[&r2].motion_authorized("r2"));
+    for id in [&r1, &r2] {
+        assert_eq!(
+            plans[id].motion_authorized(id.as_str()),
+            !recovery.held_robots.iter().any(|held| held == id.as_str())
+        );
+    }
     assert_eq!(fleet.robots()[&r3].state().position().x_meters(), 7.5);
 }
 
@@ -1201,4 +1211,147 @@ fn depleted_robot_brakes_safely_and_checkpoint_preserves_incident_identity() {
         .unwrap();
     assert_eq!(restored.station_states["r1"].battery_percent, 0.0);
     assert_eq!(restored.battery_depletion_ids["r1"], event_id);
+}
+
+#[test]
+fn collision_recovery_does_not_fence_an_unrelated_independent_order() {
+    let map = open_map();
+    let r1 = RobotId::new("r1").unwrap();
+    let r2 = RobotId::new("r2").unwrap();
+    let r3 = RobotId::new("r3").unwrap();
+    let mut fleet = MultiRobotEngine::new(
+        [
+            engine(
+                "r1",
+                map.clone(),
+                WorldPosition::new(1.5, 1.5).unwrap(),
+                &[],
+            ),
+            engine(
+                "r2",
+                map.clone(),
+                WorldPosition::new(3.5, 1.5).unwrap(),
+                &[],
+            ),
+            engine("r3", map, WorldPosition::new(1.5, 3.5).unwrap(), &[]),
+        ],
+        FleetConfig::new(0.6, 50).unwrap(),
+    )
+    .unwrap();
+    let mut plans = BTreeMap::from([
+        (r1.clone(), independent_plan("r1")),
+        (r2.clone(), PlanCoordinator::new()),
+        (r3.clone(), independent_plan("r3")),
+    ]);
+    let actions = BTreeMap::from([(r1.clone(), 2), (r3.clone(), 2)]);
+    let step = (0..30)
+        .find_map(|_| {
+            let step = fleet
+                .step_with_independent_plans(&actions, &BTreeMap::new(), &mut plans)
+                .unwrap();
+            step.recovery.is_some().then_some(step)
+        })
+        .expect("moving robot must stop before the parked robot");
+    assert_eq!(step.recovery.unwrap().held_robots, vec!["r1"]);
+    assert!(!plans[&r1].motion_authorized("r1"));
+    assert!(plans[&r3].motion_authorized("r3"));
+    let before = fleet.robots()[&r3].state().position().x_meters();
+    fleet
+        .step_with_independent_plans(&actions, &BTreeMap::new(), &mut plans)
+        .unwrap();
+    assert!(fleet.robots()[&r3].state().position().x_meters() > before);
+}
+
+#[test]
+fn waypoint_stop_and_turn_do_not_predict_motion_through_a_parked_robot() {
+    let map = open_map();
+    let r1 = RobotId::new("r1").unwrap();
+    let r2 = RobotId::new("r2").unwrap();
+    let mut fleet = MultiRobotEngine::new(
+        [
+            engine(
+                "r1",
+                map.clone(),
+                WorldPosition::new(2.5, 2.5).unwrap(),
+                &[],
+            ),
+            engine("r2", map, WorldPosition::new(8.5, 2.5).unwrap(), &[]),
+        ],
+        FleetConfig::new(0.5, 50).unwrap(),
+    )
+    .unwrap();
+    let mut plans = BTreeMap::from([
+        (r1.clone(), independent_plan("r1")),
+        (r2.clone(), PlanCoordinator::new()),
+    ]);
+    for target in [
+        WorldPosition::new(7.5, 2.5).unwrap(),
+        WorldPosition::new(7.5, 3.5).unwrap(),
+    ] {
+        let mut arrived = false;
+        for _ in 0..150 {
+            let state = fleet.robots()[&r1].state();
+            let action = mapf_rl_simulator::route::action_toward_position(state.position(), target);
+            let step = fleet
+                .step_with_independent_plans(
+                    &BTreeMap::from([(r1.clone(), action)]),
+                    &BTreeMap::from([(r1.clone(), target)]),
+                    &mut plans,
+                )
+                .unwrap();
+            assert!(
+                step.recovery.is_none(),
+                "a safe waypoint stop must not be extrapolated past its target"
+            );
+            let state = step.records[&r1].state;
+            if (state.position().x_meters() - target.x_meters()).abs() < 1e-6
+                && (state.position().y_meters() - target.y_meters()).abs() < 1e-6
+                && state.velocity().magnitude() < 1e-6
+            {
+                arrived = true;
+                break;
+            }
+        }
+        assert!(arrived);
+    }
+}
+
+#[test]
+fn target_on_a_parked_robot_still_triggers_collision_recovery() {
+    let map = open_map();
+    let r1 = RobotId::new("r1").unwrap();
+    let r2 = RobotId::new("r2").unwrap();
+    let target = WorldPosition::new(4.5, 2.5).unwrap();
+    let mut fleet = MultiRobotEngine::new(
+        [
+            engine(
+                "r1",
+                map.clone(),
+                WorldPosition::new(1.5, 2.5).unwrap(),
+                &[],
+            ),
+            engine("r2", map, target, &[]),
+        ],
+        FleetConfig::new(0.5, 50).unwrap(),
+    )
+    .unwrap();
+    let mut plans = BTreeMap::from([
+        (r1.clone(), independent_plan("r1")),
+        (r2.clone(), PlanCoordinator::new()),
+    ]);
+    let recovery = (0..100)
+        .find_map(|_| {
+            fleet
+                .step_with_independent_plans(
+                    &BTreeMap::from([(r1.clone(), 2)]),
+                    &BTreeMap::from([(r1.clone(), target)]),
+                    &mut plans,
+                )
+                .unwrap()
+                .recovery
+        })
+        .expect("target control must not disable collision prediction");
+    assert!(recovery.held_robots.contains(&"r1".into()));
+    assert!(!plans[&r1].motion_authorized("r1"));
+    assert!(fleet.robots()[&r1].state().position().x_meters() < 4.0);
 }

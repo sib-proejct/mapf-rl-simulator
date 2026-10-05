@@ -30,3 +30,6 @@ pub mod types;
 pub mod world;
 
 pub mod fleet_operational;
+
+pub mod telemetry;
+pub mod traffic;

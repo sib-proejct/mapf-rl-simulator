@@ -10,7 +10,7 @@ use crate::spool::{AckResult, AppliedOrder, DurableSpool, PreparedOrder, SpoolEr
 use std::fmt;
 use uuid::Uuid;
 
-pub const STATE_REPORT_INTERVAL_MS: u64 = 100;
+pub const STATE_REPORT_INTERVAL_MS: u64 = 200;
 pub const REST_FALLBACK_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +36,7 @@ pub struct OrderDecision {
 }
 
 pub struct CoreSession {
+    traffic_wait: Option<crate::contracts::provisioning_generated::TrafficWait>,
     simulator_id: String,
     robot_id: String,
     map: MapIdentity,
@@ -46,6 +47,7 @@ pub struct CoreSession {
     stream_id: Option<String>,
     last_stream_sequence: Option<u64>,
     next_state_report_ms: u64,
+    last_state_report_ms: Option<u64>,
     station_state: Option<crate::station::StationState>,
     station_safe: bool,
     next_rest_fallback_ms: Option<u64>,
@@ -67,6 +69,7 @@ impl CoreSession {
             return Err(SessionError::InvalidIdentity("spool simulatorId"));
         }
         Ok(Self {
+            traffic_wait: None,
             simulator_id,
             robot_id,
             map,
@@ -77,6 +80,7 @@ impl CoreSession {
             stream_id: None,
             last_stream_sequence: None,
             next_state_report_ms: 0,
+            last_state_report_ms: None,
             station_state: None,
             station_safe: true,
             next_rest_fallback_ms: None,
@@ -85,6 +89,13 @@ impl CoreSession {
 
     pub const fn state(&self) -> SessionState {
         self.state
+    }
+
+    pub fn set_traffic_wait(
+        &mut self,
+        wait: Option<crate::contracts::provisioning_generated::TrafficWait>,
+    ) {
+        self.traffic_wait = wait;
     }
 
     pub const fn session_epoch(&self) -> Option<u64> {
@@ -302,14 +313,26 @@ impl CoreSession {
     }
 
     pub fn state_report_due(&mut self, monotonic_ms: u64) -> bool {
-        if monotonic_ms < self.next_state_report_ms {
+        self.state_report_due_or_forced(monotonic_ms, false)
+    }
+
+    /// Critical transitions may publish early, but never duplicate a tick's state.
+    pub fn state_report_due_or_forced(&mut self, monotonic_ms: u64, force: bool) -> bool {
+        if self.last_state_report_ms == Some(monotonic_ms)
+            || (!force && monotonic_ms < self.next_state_report_ms)
+        {
             return false;
         }
-        self.next_state_report_ms = self
-            .next_state_report_ms
-            .saturating_add(STATE_REPORT_INTERVAL_MS);
-        if self.next_state_report_ms <= monotonic_ms {
-            self.next_state_report_ms = monotonic_ms.saturating_add(STATE_REPORT_INTERVAL_MS);
+        self.last_state_report_ms = Some(monotonic_ms);
+        // An early critical report does not shift the periodic clock. Advance
+        // from the scheduled deadline so sub-tick jitter cannot reduce 5 Hz to 3 Hz.
+        if monotonic_ms >= self.next_state_report_ms {
+            self.next_state_report_ms = self
+                .next_state_report_ms
+                .saturating_add(STATE_REPORT_INTERVAL_MS);
+            if self.next_state_report_ms <= monotonic_ms {
+                self.next_state_report_ms = monotonic_ms.saturating_add(STATE_REPORT_INTERVAL_MS);
+            }
         }
         true
     }
@@ -326,12 +349,32 @@ impl CoreSession {
         pose: PoseReport,
         occurred_at: String,
     ) -> Result<Uuid, SessionError> {
+        let report =
+            self.build_state_report(state_version, simulation_time_ms, pose, occurred_at)?;
+        let id = report.message_id;
+        self.spool.enqueue(report)?;
+        Ok(id)
+    }
+
+    pub fn enqueue_state_report(&mut self, report: ReportEnvelope) -> Result<(), SessionError> {
+        self.spool.enqueue(report)?;
+        Ok(())
+    }
+
+    pub fn build_state_report(
+        &mut self,
+        state_version: u64,
+        simulation_time_ms: i64,
+        pose: PoseReport,
+        occurred_at: String,
+    ) -> Result<ReportEnvelope, SessionError> {
         if self.state != SessionState::Synchronized {
             return Err(SessionError::NotSynchronized);
         }
         let epoch = self.session_epoch.ok_or(SessionError::NoSession)?;
         let applied = self.spool.applied_order();
         let payload = RobotStatePayload {
+            traffic_wait: self.traffic_wait.clone().map(Box::new),
             state_version,
             simulation_time_ms,
             pose,
@@ -356,7 +399,9 @@ impl CoreSession {
                 .to_owned()
             }),
             safety: self.station_state.as_ref().map(|_| {
-                if self.station_safe {
+                if self.station_safe && self.traffic_wait.is_some() {
+                    "WAIT"
+                } else if self.station_safe {
                     "NORMAL"
                 } else {
                     "CONTROLLED_STOP"
@@ -384,8 +429,7 @@ impl CoreSession {
             robot_id: self.robot_id.clone(),
             payload: ReportPayload::State(payload),
         };
-        self.spool.enqueue(report)?;
-        Ok(message_id)
+        Ok(report)
     }
 
     pub fn queue_order_completed(

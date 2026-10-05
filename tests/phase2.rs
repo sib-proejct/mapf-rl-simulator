@@ -452,19 +452,78 @@ fn reconnect_fences_old_epoch_and_converges_with_authoritative_snapshot() {
 }
 
 #[test]
-fn report_clock_is_ten_hz_and_rest_fallback_is_five_seconds() {
+fn report_clock_is_five_hz_and_rest_fallback_is_five_seconds() {
     let temp = TempDir::new().unwrap();
     let map = map();
     let mut session = session(&temp, map.clone(), Uuid::new_v4());
     synchronize(&mut session, 1, map);
+    assert_eq!(STATE_REPORT_INTERVAL_MS, 200);
     assert!(session.state_report_due(0));
+    assert!(!session.state_report_due(0));
+    assert!(!session.state_report_due(100));
     assert!(!session.state_report_due(STATE_REPORT_INTERVAL_MS - 1));
     assert!(session.state_report_due(STATE_REPORT_INTERVAL_MS));
+    assert!(session.state_report_due_or_forced(300, true));
+    assert!(!session.state_report_due_or_forced(300, true));
+    assert!(session.state_report_due(400));
+    assert!(!session.state_report_due(500));
+    assert!(session.state_report_due(1_500));
+    assert!(!session.state_report_due(1_501));
+    assert!(!session.state_report_due(1_699));
+    assert!(session.state_report_due(1_700));
 
     session.mark_disconnected(10);
     assert!(!session.rest_fallback_due(10 + REST_FALLBACK_INTERVAL_MS - 1));
     assert!(session.rest_fallback_due(10 + REST_FALLBACK_INTERVAL_MS));
     assert!(!session.rest_fallback_due(10 + REST_FALLBACK_INTERVAL_MS + 1));
+}
+
+#[test]
+fn periodic_deadlines_do_not_drift_with_tick_jitter() {
+    let temp = TempDir::new().unwrap();
+    let map = map();
+    let mut session = session(&temp, map.clone(), Uuid::new_v4());
+    synchronize(&mut session, 1, map);
+    assert!(session.state_report_due(1));
+    assert!(!session.state_report_due(101));
+    assert!(session.state_report_due(200));
+    assert!(!session.state_report_due(301));
+    assert!(session.state_report_due(400));
+    assert!(!session.state_report_due(501));
+    assert!(session.state_report_due(600));
+}
+
+#[test]
+fn scheduled_and_forced_states_keep_sequences_contiguous_and_physical_versions() {
+    let temp = TempDir::new().unwrap();
+    let map = map();
+    let mut session = session(&temp, map.clone(), Uuid::new_v4());
+    synchronize(&mut session, 1, map);
+    for ms in [0, 100, 200, 300, 400] {
+        if session.state_report_due_or_forced(ms, ms == 300) {
+            session
+                .queue_state_report(
+                    ms / 100,
+                    ms as i64,
+                    PoseReport {
+                        x_meters: 1.0,
+                        y_meters: 2.0,
+                        yaw_radians: 0.0,
+                    },
+                    NOW.to_owned(),
+                )
+                .unwrap();
+        }
+    }
+    let reports = session.spool().pending();
+    assert_eq!(reports.len(), 4);
+    for (index, version) in [0, 2, 3, 4].into_iter().enumerate() {
+        assert_eq!(reports[index].report_sequence, index as u64);
+        let ReportPayload::State(state) = &reports[index].payload else {
+            panic!("expected state");
+        };
+        assert_eq!(state.state_version, version);
+    }
 }
 
 #[test]
@@ -512,4 +571,28 @@ fn compose_http_requires_explicit_opt_in_local_profile_and_exact_service() {
         );
         assert_eq!(result.is_ok(), accepted);
     }
+}
+
+#[test]
+fn volatile_state_construction_never_spools_or_consumes_durable_sequence() {
+    let temp = TempDir::new().unwrap();
+    let map = map();
+    let mut session = session(&temp, map.clone(), Uuid::new_v4());
+    synchronize(&mut session, 1, map);
+    let pose = PoseReport {
+        x_meters: 1.0,
+        y_meters: 2.0,
+        yaw_radians: 0.0,
+    };
+    for tick in 0..20 {
+        let report = session
+            .build_state_report(tick, (tick * 100) as i64, pose, NOW.to_owned())
+            .unwrap();
+        assert_eq!(report.report_sequence, 0);
+        assert!(session.spool().pending().is_empty());
+    }
+    session
+        .queue_state_report(20, 2000, pose, NOW.to_owned())
+        .unwrap();
+    assert_eq!(session.spool().pending()[0].report_sequence, 0);
 }

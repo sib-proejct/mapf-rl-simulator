@@ -1,6 +1,7 @@
 //! Local dynamic fleet: per-robot sessions with one atomic deterministic physics tick.
 use crate::checkpoint::CheckpointStore;
 use crate::contracts::provisioning_generated::{
+    AcknowledgeMotionProfilesRequest, MotionProfile, MotionProfileTarget, MotionProfilesOutcome,
     RobotRemovalOutcome, RuntimeClaimOutcome, RuntimeClaimRequest, RuntimeRemovalOutcome,
     RuntimeRemovalRequest, RuntimeResultRequest, RuntimeRobotClaim,
 };
@@ -11,7 +12,7 @@ use crate::motion::MotionLimits;
 use crate::operational::*;
 use crate::plan::{PlanCoordinator, PlanRevision, PlanTarget};
 use crate::protocol::{CommandDisposition, EventSeverity, OrderPhase, PoseReport};
-use crate::route::{action_toward_position, target_for_route};
+use crate::route::{action_toward_position, motion_target_for_route};
 use crate::runtime::{IncidentReport, Phase2Runtime, RuntimeEvent};
 use crate::safety::SafetyConfig;
 use crate::sensing::SensorConfig;
@@ -28,6 +29,13 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 type Fleet = MultiRobotEngine<ManualMonotonicClock>;
+
+// Fleet physics remains atomic; only robots held by this recovery lose authority.
+fn recovery_affects(step: &FleetStep, robot_id: &str) -> bool {
+    step.recovery
+        .as_ref()
+        .is_some_and(|recovery| recovery.held_robots.iter().any(|held| held == robot_id))
+}
 
 struct FleetStartup {
     recovered: Option<crate::checkpoint::RecoveryCheckpoint>,
@@ -84,7 +92,7 @@ struct Intent {
     stopped_at_goal_before_tick: bool,
     previous_position: WorldPosition,
     action: i32,
-    target: Option<WorldPosition>,
+    target: Option<crate::motion::MotionTarget>,
 }
 
 impl RobotRuntime {
@@ -132,7 +140,11 @@ impl RobotRuntime {
             map,
             RobotState::new(initial_position, Velocity::ZERO, Acceleration::ZERO, 0.0)?,
             EngineConfig {
-                motion_limits: MotionLimits::new(1.0, 2.0, 3.0, 6.0, 30.0, 60.0)?,
+                motion_limits: recovered
+                    .and_then(|checkpoint| checkpoint.motion_profiles.get(&config.robot_id))
+                    .map(|profile| profile.motion_limits())
+                    .transpose()?
+                    .unwrap_or(MotionLimits::new(1.0, 2.0, 3.0, 6.0, 30.0, 60.0)?),
                 safety: SafetyConfig::new(0.2, 0.05)?,
                 sensor: SensorConfig::new(0.0, 0)?,
             },
@@ -238,16 +250,21 @@ impl RobotRuntime {
             None
         } else if let Some(order) = &applied {
             if let Some(route) = &order.route {
-                match target_for_route(
-                    engine.map(),
-                    engine.state().position(),
-                    engine.simulation_time(),
-                    route,
-                ) {
-                    Ok(target) => Some(target),
-                    Err(_) => {
-                        route_deviation = true;
-                        None
+                if route.execution_control.as_deref() != Some("occupancy-rights-v1") {
+                    route_deviation = true;
+                    None
+                } else {
+                    match motion_target_for_route(
+                        engine.map(),
+                        engine.state(),
+                        engine.simulation_time(),
+                        route,
+                    ) {
+                        Ok(target) => Some(target),
+                        Err(_) => {
+                            route_deviation = true;
+                            None
+                        }
                     }
                 }
             } else {
@@ -256,13 +273,14 @@ impl RobotRuntime {
                         .map()
                         .grid_to_world(GridCell::new(goal.column, goal.row))
                         .ok()
+                        .map(Into::into)
                 })
             }
         } else {
             None
         };
         let action = target.map_or(0, |target| {
-            action_toward_position(engine.state().position(), target)
+            action_toward_position(engine.state().position(), target.position)
         });
 
         Ok(Intent {
@@ -290,7 +308,7 @@ impl RobotRuntime {
             && self.plans.motion_authorized(&self.config.robot_id)
             && !engine.emergency_stop_latched()
             && !intent.route_deviation
-            && step.recovery.is_none()
+            && !recovery_affects(step, &self.config.robot_id)
             && record.safety_outcome == crate::safety::SafetyOutcome::Accept;
         let arrived = intent
             .applied
@@ -363,7 +381,7 @@ impl RobotRuntime {
         if route_deviation && !recovery_reported {
             plans.hold_for_recovery(None)?;
         }
-        if !recovery_reported && (route_deviation || step.recovery.is_some()) {
+        if !recovery_reported && (route_deviation || recovery_affects(step, &config.robot_id)) {
             let (code, held_robots) = if route_deviation {
                 ("SAFETY_ROUTE_DEVIATION", vec![config.robot_id.clone()])
             } else {
@@ -406,7 +424,7 @@ impl RobotRuntime {
             && plans.motion_authorized(&config.robot_id)
             && !engine.emergency_stop_latched()
             && !route_deviation
-            && step.recovery.is_none()
+            && !recovery_affects(step, &self.config.robot_id)
             && record.safety_outcome == crate::safety::SafetyOutcome::Accept;
         runtime
             .set_station_state(
@@ -416,7 +434,7 @@ impl RobotRuntime {
                         && !abort_pending
                         && !engine.emergency_stop_latched()
                         && !route_deviation
-                        && step.recovery.is_none()
+                        && !recovery_affects(step, &config.robot_id)
                         && record.safety_outcome == crate::safety::SafetyOutcome::Accept,
             )
             .await?;
@@ -459,10 +477,32 @@ impl RobotRuntime {
             && engine.state().acceleration().magnitude() < 1.0e-6
         {
             runtime
+                .publish_state_now(
+                    monotonic_ms,
+                    engine.tick().get(),
+                    engine.simulation_time().get(),
+                    PoseReport {
+                        x_meters: record.state.position().x_meters(),
+                        y_meters: record.state.position().y_meters(),
+                        yaw_radians: record.state.yaw_radians(),
+                    },
+                    utc_now_milliseconds()?,
+                )
+                .await?;
+            runtime
                 .finish_abort_if_stopped(utc_now_milliseconds()?)
                 .await?;
         }
         let occurred_at = utc_now_milliseconds()?;
+        runtime
+            .set_traffic_wait(step.traffic_wait.get(&config.robot_id).map(|blockers| {
+                crate::contracts::provisioning_generated::TrafficWait {
+                    contract_version: "1.0.0".into(),
+                    reason: "PASSAGE_RIGHT_UNAVAILABLE".into(),
+                    blocking_robot_ids: blockers.iter().cloned().collect(),
+                }
+            }))
+            .await?;
         runtime
             .publish_state_if_due(
                 monotonic_ms,
@@ -516,6 +556,19 @@ impl RobotRuntime {
                     })
             })
         {
+            runtime
+                .publish_state_now(
+                    monotonic_ms,
+                    engine.tick().get(),
+                    engine.simulation_time().get(),
+                    PoseReport {
+                        x_meters: record.state.position().x_meters(),
+                        y_meters: record.state.position().y_meters(),
+                        yaw_radians: record.state.yaw_radians(),
+                    },
+                    utc_now_milliseconds()?,
+                )
+                .await?;
             runtime
                 .publish_order_completed(
                     engine.simulation_time().get(),
@@ -679,6 +732,18 @@ impl RobotRuntime {
     }
 }
 
+struct ProfileSync {
+    profiles_tx: tokio::sync::mpsc::UnboundedSender<Vec<MotionProfile>>,
+    applied_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<MotionProfileTarget>>,
+}
+
+struct FleetUpdates {
+    claims_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<RuntimeRobotClaim>>,
+    removals_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<RobotRemovalOutcome>>,
+    profiles_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<MotionProfile>>,
+    applied_tx: tokio::sync::mpsc::UnboundedSender<Vec<MotionProfileTarget>>,
+}
+
 #[derive(Clone)]
 struct Provisioner {
     http: reqwest::Client,
@@ -694,6 +759,7 @@ impl Provisioner {
         removals: tokio::sync::mpsc::UnboundedSender<Vec<RobotRemovalOutcome>>,
         started: Instant,
         renewed_ms: &AtomicU64,
+        mut sync: ProfileSync,
     ) -> Result<(), Box<dyn Error>> {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -710,6 +776,18 @@ impl Provisioner {
                 }
                 Err(error) => eprintln!("fleet lease renewal failed: {error}"),
             }
+            while let Ok(targets) = sync.applied_rx.try_recv() {
+                if let Err(error) = self.acknowledge_profiles(targets).await {
+                    eprintln!("motion profile acknowledgement failed: {error}");
+                }
+            }
+            match self.motion_profiles().await {
+                Ok(profiles) => sync
+                    .profiles_tx
+                    .send(profiles)
+                    .map_err(|_| invalid("motion profile receiver closed"))?,
+                Err(error) => eprintln!("motion profile sync failed: {error}"),
+            }
             match self.removals().await {
                 Ok(value) => removals
                     .send(value)
@@ -717,6 +795,50 @@ impl Provisioner {
                 Err(error) => eprintln!("fleet removal sync failed: {error}"),
             }
         }
+    }
+
+    async fn motion_profiles(&self) -> Result<Vec<MotionProfile>, Box<dyn Error>> {
+        let response = self
+            .http
+            .get(self.base.join("api/v1/runtime/motion-profiles")?)
+            .query(&[("bootId", self.boot_id.to_string())])
+            .header("X-Runtime-Key", self.key.clone())
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new()); // Backward-compatible older Core.
+        }
+        let outcome = response
+            .error_for_status()?
+            .json::<MotionProfilesOutcome>()
+            .await?;
+        if outcome.contract_version != "1.0.0"
+            || outcome.profiles.iter().any(|profile| {
+                profile.applied_version > profile.version || profile.limits.motion_limits().is_err()
+            })
+        {
+            return Err(invalid("unsupported or invalid motion profile").into());
+        }
+        Ok(outcome.profiles)
+    }
+
+    async fn acknowledge_profiles(
+        &self,
+        targets: Vec<MotionProfileTarget>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.http
+            .post(self.base.join("api/v1/runtime/motion-profiles/ack")?)
+            .header("X-Runtime-Key", self.key.clone())
+            .json(&AcknowledgeMotionProfilesRequest {
+                contract_version: "1.0.0".into(),
+                request_id: Uuid::new_v4().to_string(),
+                boot_id: self.boot_id.to_string(),
+                targets,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     fn new(config: &OperationalConfig) -> Result<Self, Box<dyn Error>> {
@@ -975,6 +1097,9 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         checkpoint
             .battery_depletion_ids
             .retain(|id, _| !removed.contains(id.as_str()));
+        checkpoint
+            .motion_profiles
+            .retain(|id, _| !removed.contains(id.as_str()));
     }
     let known = initial_claims
         .iter()
@@ -982,19 +1107,20 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         .collect();
     let (claims_tx, claims_rx) = tokio::sync::mpsc::unbounded_channel();
     let (removals_tx, removals_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (profiles_tx, profiles_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (applied_tx, applied_rx) = tokio::sync::mpsc::unbounded_channel();
     let heartbeat = provisioner.clone();
     tokio::select! {
         biased;
         _ = lease_expired(started, &renewed_ms) => Err(invalid("local fleet runtime lease was lost").into()),
-        result = heartbeat.renew_lease(known, claims_tx, removals_tx, started, &renewed_ms) => result,
+        result = heartbeat.renew_lease(known, claims_tx, removals_tx, started, &renewed_ms, ProfileSync { profiles_tx, applied_rx }) => result,
         result = run_fleet(
             base,
             provisioner,
             store,
             FleetStartup { recovered, initial_claims, initial_removals },
             started,
-            claims_rx,
-            removals_rx,
+            FleetUpdates { claims_rx, removals_rx, profiles_rx, applied_tx },
         ) => result,
     }
 }
@@ -1005,8 +1131,7 @@ async fn run_fleet(
     store: CheckpointStore,
     startup: FleetStartup,
     started: Instant,
-    mut claims_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<RuntimeRobotClaim>>,
-    mut removals_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<RobotRemovalOutcome>>,
+    mut updates: FleetUpdates,
 ) -> Result<(), Box<dyn Error>> {
     let FleetStartup {
         recovered,
@@ -1042,13 +1167,55 @@ async fn run_fleet(
     }
     persist(&fleet, &robots, &store, &base).await?;
     let mut removals = initial_removals;
+    let mut profiles = Vec::new();
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
         let monotonic_ms = elapsed_milliseconds(started);
-        while let Ok(value) = removals_rx.try_recv() {
+        while let Ok(value) = updates.removals_rx.try_recv() {
             removals = value;
+        }
+        while let Ok(value) = updates.profiles_rx.try_recv() {
+            profiles = value;
+        }
+        let mut applied_profiles = Vec::new();
+        for profile in &profiles {
+            let id = RobotId::new(profile.robot_id.clone())?;
+            let Some(robot) = robots.get(&id) else {
+                continue;
+            };
+            let Some(engine) = fleet.robots().get(&id) else {
+                continue;
+            };
+            let limits = profile.limits.motion_limits()?;
+            if engine.motion_limits() == limits && profile.applied_version == profile.version {
+                continue;
+            }
+            // Do not alter a prepared or active route; wait for safe idle state.
+            if !robot.connected
+                || robot.runtime.applied_order().await?.is_some()
+                || robot.runtime.prepared_order().await?.is_some()
+                || robot.runtime.abort_pending().await?
+                || !robot.runtime.synchronized().await?
+            {
+                continue;
+            }
+            if fleet.apply_motion_profile(&id, &profile.limits)? {
+                applied_profiles.push(MotionProfileTarget {
+                    robot_id: profile.robot_id.clone(),
+                    version: profile.version,
+                });
+            }
+        }
+        if !applied_profiles.is_empty() {
+            // Persist the actual limits before letting Core admit a new route.
+            persist(&fleet, &robots, &store, &base).await?;
+            updates
+                .applied_tx
+                .send(applied_profiles)
+                .map_err(|_| invalid("motion profile ack receiver closed"))?;
+            profiles.clear(); // The heartbeat retries if an ACK is lost.
         }
         for removal in &mut removals {
             let id = RobotId::new(removal.robot_id.clone())?;
@@ -1072,7 +1239,7 @@ async fn run_fleet(
                 }
             }
         }
-        if let Ok(claims) = claims_rx.try_recv() {
+        if let Ok(claims) = updates.claims_rx.try_recv() {
             let claims = claims
                 .into_iter()
                 .filter(|claim| {
@@ -1130,7 +1297,7 @@ async fn run_fleet(
             .iter()
             .map(|(id, robot)| (id.clone(), robot.plans.clone()))
             .collect();
-        let step = fleet.step_with_independent_plans(&actions, &targets, &mut plans)?;
+        let step = fleet.step_with_passage_rights(&actions, &targets, &mut plans)?;
         for (id, robot) in &mut robots {
             robot.plans = plans
                 .remove(id)
@@ -1160,6 +1327,30 @@ async fn run_fleet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_only_pauses_station_and_incident_processing_for_held_robots() {
+        let mut step = FleetStep {
+            traffic_wait: BTreeMap::new(),
+            records: BTreeMap::new(),
+            stationary_reservations: BTreeSet::new(),
+            recovery: Some(crate::fleet::RecoveryEvent {
+                reason: RecoveryReason::Collision,
+                held_robots: vec!["r1".into()],
+                replan_required: true,
+            }),
+        };
+        assert!(recovery_affects(&step, "r1"));
+        assert!(!recovery_affects(&step, "r2"));
+        step.recovery
+            .as_mut()
+            .unwrap()
+            .held_robots
+            .push("r2".into());
+        assert!(recovery_affects(&step, "r2"));
+        step.recovery = None;
+        assert!(!recovery_affects(&step, "r1"));
+    }
 
     #[test]
     fn reconnect_delay_grows_caps_and_staggers_robots() {

@@ -233,6 +233,7 @@ async fn run_scenario(
             );
             sleep(Duration::from_millis(100)).await;
         }
+        wait_for_buffer_waiting(&client, &rest_base).await;
         simulator.0.kill().unwrap();
         core.0.kill().unwrap();
         return;
@@ -418,15 +419,20 @@ async fn run_scenario(
                         entity["entityType"] == "ROBOT" && entity["entityId"] == "robot-1"
                     })
                     .expect("completed order must include robot state");
-                let pose = &robot["data"]["pose"];
-                assert!(
-                    (pose["xMeters"].as_f64().unwrap() - (f64::from(column) + 0.5)).abs() < 1.0e-6,
-                    "{robot}"
-                );
-                assert!(
-                    (pose["yMeters"].as_f64().unwrap() - 2.5).abs() < 1.0e-6,
-                    "{robot}"
-                );
+                // Low-battery recovery may already be driving to the charger
+                // when the next snapshot observes this completed Order.
+                if battery != BatteryScenario::AutoCharge {
+                    let pose = &robot["data"]["pose"];
+                    assert!(
+                        (pose["xMeters"].as_f64().unwrap() - (f64::from(column) + 0.5)).abs()
+                            < 1.0e-6,
+                        "{robot}"
+                    );
+                    assert!(
+                        (pose["yMeters"].as_f64().unwrap() - 2.5).abs() < 1.0e-6,
+                        "{robot}"
+                    );
+                }
                 if let Some(action) = arrival_action {
                     let state = &robot["data"]["stationState"];
                     assert_eq!(state["action"], action);
@@ -446,6 +452,9 @@ async fn run_scenario(
                 "Order did not complete before timeout: {snapshot}"
             );
             sleep(Duration::from_millis(100)).await;
+        }
+        if arrival_action == Some("PLACE") {
+            wait_for_buffer_waiting(&client, &rest_base).await;
         }
     }
     if battery == BatteryScenario::AutoCharge {
@@ -603,5 +612,47 @@ async fn wait_until(mut timeout: Duration, mut condition: impl FnMut() -> bool) 
         let step = timeout.min(Duration::from_millis(25));
         sleep(step).await;
         timeout = timeout.saturating_sub(step);
+    }
+}
+
+async fn wait_for_buffer_waiting(client: &reqwest::Client, rest_base: &str) {
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let snapshot = client
+            .get(format!("{rest_base}api/v1/operations/snapshot"))
+            .header("Cookie", "__Host-mapf_session=operator-session")
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        let entities = snapshot["entities"].as_array().unwrap();
+        if let Some(state) = entities
+            .iter()
+            .find(|e| e["entityType"] == "BUFFER_STATE" && e["entityId"] == "robot-1")
+        {
+            assert_ne!(
+                state["data"]["phase"], "HELD",
+                "Buffer departure failed: {snapshot}"
+            );
+            if state["data"]["phase"] == "WAITING" {
+                assert_eq!(state["data"]["bufferOccupied"], true);
+                assert_eq!(state["data"]["stationClear"], true);
+                let robot = entities
+                    .iter()
+                    .find(|e| e["entityType"] == "ROBOT" && e["entityId"] == "robot-1")
+                    .unwrap();
+                assert!((robot["data"]["pose"]["xMeters"].as_f64().unwrap() - 2.5).abs() < 0.1);
+                assert!((robot["data"]["pose"]["yMeters"].as_f64().unwrap() - 3.5).abs() < 0.1);
+                assert_eq!(robot["data"]["stationState"]["loaded"], false);
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Post-PLACE buffer arrival timed out: {snapshot}"
+        );
+        sleep(Duration::from_millis(100)).await;
     }
 }

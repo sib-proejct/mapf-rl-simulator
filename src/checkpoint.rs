@@ -13,6 +13,44 @@ use std::path::{Path, PathBuf};
 const CHECKPOINT_FORMAT_VERSION: u32 = 1;
 pub const MAX_CHECKPOINT_ROBOTS: usize = 10_000;
 
+/// Full physical limits, including emergency braking, for deterministic recovery.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckpointMotionLimits {
+    pub max_linear_speed_mps: f64,
+    pub max_acceleration_mps2: f64,
+    pub max_deceleration_mps2: f64,
+    pub max_emergency_deceleration_mps2: f64,
+    pub max_jerk_mps3: f64,
+    pub max_emergency_jerk_mps3: f64,
+}
+
+impl CheckpointMotionLimits {
+    pub fn from_motion_limits(limits: crate::motion::MotionLimits) -> Self {
+        Self {
+            max_linear_speed_mps: limits.max_linear_speed_mps(),
+            max_acceleration_mps2: limits.max_acceleration_mps2(),
+            max_deceleration_mps2: limits.max_deceleration_mps2(),
+            max_emergency_deceleration_mps2: limits.max_emergency_deceleration_mps2(),
+            max_jerk_mps3: limits.max_jerk_mps3(),
+            max_emergency_jerk_mps3: limits.max_emergency_jerk_mps3(),
+        }
+    }
+
+    pub fn motion_limits(
+        &self,
+    ) -> Result<crate::motion::MotionLimits, crate::types::ValidationError> {
+        crate::motion::MotionLimits::new(
+            self.max_linear_speed_mps,
+            self.max_acceleration_mps2,
+            self.max_deceleration_mps2,
+            self.max_emergency_deceleration_mps2,
+            self.max_jerk_mps3,
+            self.max_emergency_jerk_mps3,
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RobotSafetyCheckpoint {
@@ -67,6 +105,8 @@ pub struct RecoveryCheckpoint {
     pub plans: PlanCoordinator,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub independent_plans: std::collections::BTreeMap<String, PlanCoordinator>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub motion_profiles: std::collections::BTreeMap<String, CheckpointMotionLimits>,
     pub no_progress_ticks: u32,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub station_states: std::collections::BTreeMap<String, crate::station::StationState>,
@@ -104,6 +144,12 @@ impl RecoveryCheckpoint {
             || self.robots.is_empty()
             || self.robots.len() > MAX_CHECKPOINT_ROBOTS
         {
+            return Err(CheckpointError::Corrupt);
+        }
+        if self.motion_profiles.iter().any(|(id, limits)| {
+            !self.robots.iter().any(|robot| &robot.robot_id == id)
+                || limits.motion_limits().is_err()
+        }) {
             return Err(CheckpointError::Corrupt);
         }
         if self.station_states.iter().any(|(id, state)| {

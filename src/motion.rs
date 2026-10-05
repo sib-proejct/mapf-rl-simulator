@@ -13,6 +13,22 @@ const SAFETY_SAMPLE_SECONDS: f64 = CONTROL_TICK_SECONDS;
 const MAX_RUCKIG_TRAJECTORY_SECONDS: f64 = 7_000.0;
 const MOTION_STATE_EPSILON: f64 = 1.0e-8;
 
+/// A stop endpoint and an optional route-derived cruise speed (metres/second).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MotionTarget {
+    pub position: WorldPosition,
+    pub cruise_speed_mps: Option<f64>,
+}
+
+impl From<WorldPosition> for MotionTarget {
+    fn from(position: WorldPosition) -> Self {
+        Self {
+            position,
+            cruise_speed_mps: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MotionLimits {
     max_linear_speed: MetersPerSecond,
@@ -223,6 +239,21 @@ pub fn preview_motion_to_target(
     limits: MotionLimits,
     actuator: ActuatorEffect,
 ) -> Result<MotionPreview, MotionError> {
+    preview_motion_to_route_target(state, action, target.into(), limits, actuator)
+}
+
+pub fn preview_motion_to_route_target(
+    state: RobotState,
+    action: ActionCandidate,
+    target: MotionTarget,
+    limits: MotionLimits,
+    actuator: ActuatorEffect,
+) -> Result<MotionPreview, MotionError> {
+    let cruise_speed = target
+        .cruise_speed_mps
+        .unwrap_or(limits.max_linear_speed_mps());
+    ensure_positive(cruise_speed, "motion.cruise_speed").map_err(|_| MotionError::InvalidInput)?;
+    let speed_limit = cruise_speed.min(limits.max_linear_speed_mps());
     let direction = action_vector(action);
     let current = path_state(state, direction)?;
     if action == ActionCandidate::Wait
@@ -232,8 +263,8 @@ pub fn preview_motion_to_target(
     {
         return preview_holonomic_motion(state, action, limits, actuator);
     }
-    let dx = target.x_meters() - state.position().x_meters();
-    let dy = target.y_meters() - state.position().y_meters();
+    let dx = target.position.x_meters() - state.position().x_meters();
+    let dy = target.position.y_meters() - state.position().y_meters();
     let distance = dx * direction.0 + dy * direction.1;
     if distance < -SAFETY_EPSILON_METERS {
         return Err(MotionError::InvalidInput);
@@ -250,7 +281,7 @@ pub fn preview_motion_to_target(
     )?;
     input.control_interface = ControlInterface::Position;
     input.target_position = vec![distance.max(0.0)];
-    input.max_velocity = vec![limits.max_linear_speed_mps() * actuator.speed_scale];
+    input.max_velocity = vec![speed_limit * actuator.speed_scale];
     let mut output = OutputParameter::new_direct(1);
     let mut ruckig = Ruckig::new_direct(1, CONTROL_TICK_SECONDS);
     ensure_ruckig_success(ruckig.update(&mut input, &mut output))?;
@@ -578,6 +609,38 @@ fn ensure_ruckig_success(result: RuckigResult) -> Result<(), MotionError> {
         | RuckigResult::ErrorPositionalLimits
         | RuckigResult::ErrorExecutionTimeCalculation
         | RuckigResult::ErrorSynchronizationCalculation => Err(MotionError::CalculationFailed),
+    }
+}
+
+impl crate::contracts::provisioning_generated::MotionProfileLimits {
+    pub fn motion_limits(&self) -> Result<MotionLimits, ValidationError> {
+        for (value, upper) in [
+            (self.max_linear_speed_mps, 3.0),
+            (self.max_linear_acceleration_mps2, 3.0),
+            (self.max_linear_deceleration_mps2, 3.0),
+            (self.max_linear_jerk_mps3, 30.0),
+        ] {
+            if !value.is_finite() || !(0.1..=upper).contains(&value) {
+                return Err(ValidationError::OutOfRange("motion.profile"));
+            }
+        }
+        MotionLimits::new(
+            self.max_linear_speed_mps,
+            self.max_linear_acceleration_mps2,
+            self.max_linear_deceleration_mps2,
+            6.0,
+            self.max_linear_jerk_mps3,
+            60.0,
+        )
+    }
+
+    pub fn from_motion_limits(limits: MotionLimits) -> Self {
+        Self {
+            max_linear_speed_mps: limits.max_linear_speed_mps(),
+            max_linear_acceleration_mps2: limits.max_acceleration_mps2(),
+            max_linear_deceleration_mps2: limits.max_deceleration_mps2(),
+            max_linear_jerk_mps3: limits.max_jerk_mps3(),
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 //! Atomic, deterministic multi-robot tick scheduling and local recovery.
 
 use crate::checkpoint::{RecoveryCheckpoint, RobotSafetyCheckpoint};
+use crate::motion::MotionTarget;
 use crate::plan::{PlanCoordinator, PlanError};
 use crate::simulation::{EngineError, MonotonicClock, SimulationEngine, StepRecord};
 use crate::types::{
@@ -26,6 +27,7 @@ pub struct RecoveryEvent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FleetStep {
+    pub traffic_wait: BTreeMap<String, BTreeSet<String>>,
     pub records: BTreeMap<RobotId, StepRecord>,
     pub stationary_reservations: BTreeSet<String>,
     pub recovery: Option<RecoveryEvent>,
@@ -66,6 +68,8 @@ impl FleetConfig {
 
 /// The BTreeMap order is the single deterministic fleet commit order.
 pub struct MultiRobotEngine<C> {
+    passage_rights: crate::traffic::PassageRights,
+    passage_targets: BTreeMap<RobotId, MotionTarget>,
     robots: BTreeMap<RobotId, SimulationEngine<C>>,
     config: FleetConfig,
     no_progress_ticks: u32,
@@ -91,6 +95,8 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             config.minimum_center_separation_meters,
         )?;
         Ok(Self {
+            passage_rights: crate::traffic::PassageRights::default(),
+            passage_targets: BTreeMap::new(),
             robots: ordered,
             config,
             no_progress_ticks: 0,
@@ -115,8 +121,22 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             return Ok(false);
         }
         self.robots.remove(id);
+        self.passage_targets.remove(id);
         self.no_progress_ticks = 0;
         Ok(true)
+    }
+
+    pub fn apply_motion_profile(
+        &mut self,
+        id: &RobotId,
+        profile: &crate::contracts::provisioning_generated::MotionProfileLimits,
+    ) -> Result<bool, FleetError> {
+        let limits = profile.motion_limits().map_err(EngineError::from)?;
+        Ok(self
+            .robots
+            .get_mut(id)
+            .ok_or(FleetError::UnknownRobot)?
+            .apply_motion_limits(limits)?)
     }
 
     pub const fn no_progress_ticks(&self) -> u32 {
@@ -158,6 +178,18 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
                 .collect(),
             plans,
             independent_plans: BTreeMap::new(),
+            motion_profiles: self
+                .robots
+                .iter()
+                .map(|(id, engine)| {
+                    (
+                        id.as_str().to_owned(),
+                        crate::checkpoint::CheckpointMotionLimits::from_motion_limits(
+                            engine.motion_limits(),
+                        ),
+                    )
+                })
+                .collect(),
             no_progress_ticks: self.no_progress_ticks,
             station_states: BTreeMap::new(),
             battery_depletion_ids: BTreeMap::new(),
@@ -187,6 +219,14 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             let id =
                 RobotId::new(robot.robot_id.clone()).map_err(|_| FleetError::InvalidCheckpoint)?;
             let engine = restored.get_mut(&id).ok_or(FleetError::InvalidCheckpoint)?;
+            if let Some(profile) = checkpoint.motion_profiles.get(&robot.robot_id) {
+                let limits = profile
+                    .motion_limits()
+                    .map_err(|_| FleetError::InvalidCheckpoint)?;
+                if !engine.apply_motion_limits(limits)? {
+                    return Err(FleetError::InvalidCheckpoint);
+                }
+            }
             let state = RobotState::new(
                 crate::types::WorldPosition::new(robot.x_meters, robot.y_meters)
                     .map_err(|_| FleetError::InvalidCheckpoint)?,
@@ -213,6 +253,8 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             self.config.minimum_center_separation_meters,
         )?;
         self.robots = restored;
+        self.passage_rights = crate::traffic::PassageRights::default();
+        self.passage_targets.clear();
         self.no_progress_ticks = checkpoint.no_progress_ticks;
         Ok(checkpoint.plans.clone())
     }
@@ -231,6 +273,19 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         &mut self,
         requested_actions: &BTreeMap<RobotId, i32>,
         targets: &BTreeMap<RobotId, WorldPosition>,
+        plans: &mut PlanCoordinator,
+    ) -> Result<FleetStep, FleetError> {
+        let targets = targets
+            .iter()
+            .map(|(id, target)| (id.clone(), (*target).into()))
+            .collect();
+        self.step_with_motion_targets(requested_actions, &targets, plans)
+    }
+
+    pub fn step_with_motion_targets(
+        &mut self,
+        requested_actions: &BTreeMap<RobotId, i32>,
+        targets: &BTreeMap<RobotId, MotionTarget>,
         plans: &mut PlanCoordinator,
     ) -> Result<FleetStep, FleetError> {
         let authorized = self
@@ -257,6 +312,19 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         targets: &BTreeMap<RobotId, WorldPosition>,
         plans: &mut BTreeMap<RobotId, PlanCoordinator>,
     ) -> Result<FleetStep, FleetError> {
+        let targets = targets
+            .iter()
+            .map(|(id, target)| (id.clone(), (*target).into()))
+            .collect();
+        self.step_with_independent_motion_targets(requested_actions, &targets, plans)
+    }
+
+    pub fn step_with_independent_motion_targets(
+        &mut self,
+        requested_actions: &BTreeMap<RobotId, i32>,
+        targets: &BTreeMap<RobotId, MotionTarget>,
+        plans: &mut BTreeMap<RobotId, PlanCoordinator>,
+    ) -> Result<FleetStep, FleetError> {
         let authorized = plans
             .iter()
             .filter(|(id, plan)| plan.motion_authorized(id.as_str()))
@@ -268,11 +336,190 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             .as_ref()
             .is_some_and(|event| event.replan_required)
         {
-            for plan in plans.values_mut() {
-                if plan.active_revision_id().is_some() {
+            let recovery = step.recovery.as_ref().expect("checked recovery");
+            for (id, plan) in plans.iter_mut() {
+                if recovery.held_robots.iter().any(|held| held == id.as_str())
+                    && plan.active_revision_id().is_some()
+                {
                     plan.hold_for_recovery(None)?;
                 }
             }
+        }
+        Ok(step)
+    }
+
+    /// Occupancy control is used only by the default operational controller.
+    /// The existing physical prediction, collision and braking checks still run.
+    pub fn step_with_passage_rights(
+        &mut self,
+        requested_actions: &BTreeMap<RobotId, i32>,
+        targets: &BTreeMap<RobotId, MotionTarget>,
+        plans: &mut BTreeMap<RobotId, PlanCoordinator>,
+    ) -> Result<FleetStep, FleetError> {
+        use crate::traffic::{Request, corridor_resources};
+        let mut occupied = BTreeMap::new();
+        let mut retained = BTreeMap::new();
+        let mut requests = Vec::new();
+        for (id, engine) in &self.robots {
+            let map = engine.map();
+            let state = engine.state();
+            let current = map
+                .world_to_grid(state.position())
+                .map_err(FleetError::Map)?;
+            let radius = engine
+                .footprint_radius_meters()
+                .max(self.config.minimum_center_separation_meters / 2.0);
+            occupied.insert(
+                id.as_str().to_owned(),
+                passage_segment_resources(map, state.position(), state.position(), radius),
+            );
+            // Clone previews leave faults, time and emergency latches unchanged.
+            retained.insert(
+                id.as_str().to_owned(),
+                passage_motion_resources(engine, 0, None, radius)?.0,
+            );
+            let moving =
+                state.velocity().magnitude() >= 1e-6 || state.acceleration().magnitude() >= 1e-6;
+            if !moving {
+                self.passage_targets.remove(id);
+            }
+            if !plans
+                .get(id)
+                .is_some_and(|p| p.motion_authorized(id.as_str()))
+            {
+                continue;
+            }
+            let Some(target) = targets.get(id) else {
+                continue;
+            };
+            if requested_actions.get(id).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let end = map
+                .world_to_grid(target.position)
+                .map_err(FleetError::Map)?;
+            // A changed target must wait for a stop on the old axis.
+            if moving
+                && self
+                    .passage_targets
+                    .get(id)
+                    .is_some_and(|old| old != target)
+            {
+                continue;
+            }
+            if current.column() != end.column() && current.row() != end.row() {
+                return Err(FleetError::CollisionInvariant);
+            }
+            let (mut required, emergency) = passage_motion_resources(
+                engine,
+                requested_actions.get(id).copied().unwrap_or(0),
+                Some(*target),
+                radius,
+            )?;
+            if emergency {
+                continue;
+            }
+            // Narrow corridors remain exclusive, including both exits.
+            for x in current.column().min(end.column())..=current.column().max(end.column()) {
+                for y in current.row().min(end.row())..=current.row().max(end.row()) {
+                    let corridor = corridor_resources(map, (x, y));
+                    if corridor.len() > 1 {
+                        required.extend(corridor);
+                    }
+                }
+            }
+            requests.push(Request {
+                robot_id: id.as_str().to_owned(),
+                resources: required,
+            });
+        }
+        let mut allocation = self
+            .passage_rights
+            .allocate(&occupied, &retained, &requests);
+        for (id, target) in targets {
+            if allocation.granted.contains(id.as_str()) {
+                self.passage_targets.insert(id.clone(), *target);
+            }
+        }
+        let mut actions: BTreeMap<_, _> = requested_actions
+            .iter()
+            .map(|(id, action)| {
+                (
+                    id.clone(),
+                    if allocation.granted.contains(id.as_str()) {
+                        *action
+                    } else {
+                        0
+                    },
+                )
+            })
+            .collect();
+        let mut allowed_targets: BTreeMap<_, _> = targets
+            .iter()
+            .filter(|(id, _)| allocation.granted.contains(id.as_str()))
+            .map(|(id, target)| (id.clone(), *target))
+            .collect();
+        // The existing longer-horizon kernel predicts uninterrupted controller
+        // motion. Yield before entering it so ordinary traffic contention does
+        // not become a collision incident. Recheck after each WAIT decision.
+        loop {
+            let preview = self.preview(&actions, &allowed_targets, false)?;
+            let conflicts = conflicting_pairs(
+                &self.robots,
+                &preview,
+                self.config.minimum_center_separation_meters,
+                Some(MotionPrediction {
+                    actions: &actions,
+                    targets: &allowed_targets,
+                }),
+            );
+            let mut changed = false;
+            for (left, right) in conflicts {
+                let (yielding, blocker) = if !allocation.granted.contains(left.as_str()) {
+                    (right, left)
+                } else if !allocation.granted.contains(right.as_str()) {
+                    (left, right)
+                } else {
+                    // Match the final collision kernel's stable tie-breaker;
+                    // alternating forecast winners can strand a crossing robot.
+                    (right, left)
+                };
+                if allocation.granted.remove(yielding.as_str()) {
+                    actions.insert(yielding.clone(), 0);
+                    allowed_targets.remove(&yielding);
+                    allocation
+                        .blockers
+                        .entry(yielding.as_str().to_owned())
+                        .or_default()
+                        .insert(blocker.as_str().to_owned());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Forecast yielding adds edges after physical resource allocation.
+        allocation.refresh_cycle();
+        self.passage_rights.confirm(&allocation.granted);
+        let mut step =
+            self.step_with_independent_motion_targets(&actions, &allowed_targets, plans)?;
+        step.traffic_wait = allocation.blockers;
+        if !allocation.cycle.is_empty() {
+            let held_robots: Vec<_> = allocation.cycle.into_iter().collect();
+            for id in &held_robots {
+                if let Some(plan) = plans
+                    .iter_mut()
+                    .find_map(|(key, plan)| (key.as_str() == id).then_some(plan))
+                {
+                    plan.hold_for_recovery(None)?;
+                }
+            }
+            step.recovery = Some(RecoveryEvent {
+                reason: RecoveryReason::Deadlock,
+                held_robots,
+                replan_required: true,
+            });
         }
         Ok(step)
     }
@@ -303,7 +550,10 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             &candidate.robots,
             &preview,
             self.config.minimum_center_separation_meters,
-            true,
+            Some(MotionPrediction {
+                actions: &actions,
+                targets: &BTreeMap::new(),
+            }),
         )
         .is_empty()
         {
@@ -316,7 +566,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
     fn step_authorized(
         &mut self,
         requested_actions: &BTreeMap<RobotId, i32>,
-        targets: &BTreeMap<RobotId, WorldPosition>,
+        targets: &BTreeMap<RobotId, MotionTarget>,
         authorized: &BTreeSet<RobotId>,
     ) -> Result<FleetStep, FleetError> {
         let reservations: BTreeSet<String> = self
@@ -336,7 +586,10 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             &self.robots,
             &initial,
             self.config.minimum_center_separation_meters,
-            true,
+            Some(MotionPrediction {
+                actions: &actions,
+                targets,
+            }),
         );
         let mut recovery = None;
         if !conflicts.is_empty() {
@@ -378,7 +631,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
             &self.robots,
             &next,
             self.config.minimum_center_separation_meters,
-            false,
+            None,
         );
         if !remaining.is_empty() {
             let involved: BTreeSet<_> = remaining
@@ -396,7 +649,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
                 &self.robots,
                 &next,
                 self.config.minimum_center_separation_meters,
-                false,
+                None,
             )
             .is_empty()
             {
@@ -444,6 +697,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         }
         self.robots = committed;
         Ok(FleetStep {
+            traffic_wait: BTreeMap::new(),
             records,
             stationary_reservations: reservations,
             recovery,
@@ -473,7 +727,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
     fn preview(
         &self,
         actions: &BTreeMap<RobotId, i32>,
-        targets: &BTreeMap<RobotId, WorldPosition>,
+        targets: &BTreeMap<RobotId, MotionTarget>,
         emergency: bool,
     ) -> Result<BTreeMap<RobotId, (SimulationEngine<C>, StepRecord)>, FleetError> {
         let selected = if emergency {
@@ -487,7 +741,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
     fn preview_selected_emergency(
         &self,
         actions: &BTreeMap<RobotId, i32>,
-        targets: &BTreeMap<RobotId, WorldPosition>,
+        targets: &BTreeMap<RobotId, MotionTarget>,
         emergency: &BTreeSet<RobotId>,
     ) -> Result<BTreeMap<RobotId, (SimulationEngine<C>, StepRecord)>, FleetError> {
         let mut previews = BTreeMap::new();
@@ -506,11 +760,16 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
     }
 }
 
-fn conflicting_pairs<C: MonotonicClock>(
+struct MotionPrediction<'a> {
+    actions: &'a BTreeMap<RobotId, i32>,
+    targets: &'a BTreeMap<RobotId, MotionTarget>,
+}
+
+fn conflicting_pairs<C: MonotonicClock + Clone>(
     current: &BTreeMap<RobotId, SimulationEngine<C>>,
     next: &BTreeMap<RobotId, (SimulationEngine<C>, StepRecord)>,
     required: f64,
-    include_two_second_prediction: bool,
+    prediction: Option<MotionPrediction<'_>>,
 ) -> Vec<(RobotId, RobotId)> {
     let ids: Vec<_> = current.keys().collect();
     let mut conflicts = Vec::new();
@@ -522,8 +781,25 @@ fn conflicting_pairs<C: MonotonicClock>(
                 current[*right].state(),
                 next[*right].1.state,
             );
-            let predicted_distance = if include_two_second_prediction {
-                constant_velocity_distance_squared(next[*left].1.state, next[*right].1.state, 2.0)
+            let predicted_distance = if let Some(MotionPrediction { actions, targets }) = prediction
+            {
+                let straight = constant_velocity_distance_squared(
+                    next[*left].1.state,
+                    next[*right].1.state,
+                    2.0,
+                );
+                if targets.contains_key(*left) || targets.contains_key(*right) {
+                    targeted_prediction_distance_squared(
+                        &next[*left].0,
+                        &next[*right].0,
+                        actions.get(*left).copied().unwrap_or(0),
+                        actions.get(*right).copied().unwrap_or(0),
+                        targets.get(*left).copied(),
+                        targets.get(*right).copied(),
+                    )
+                } else {
+                    straight
+                }
             } else {
                 f64::INFINITY
             };
@@ -535,6 +811,128 @@ fn conflicting_pairs<C: MonotonicClock>(
         }
     }
     conflicts
+}
+
+/// Conservative swept-cell envelope including footprint and interpolation error.
+fn passage_segment_resources(
+    map: &crate::world::GridMap,
+    start: WorldPosition,
+    end: WorldPosition,
+    radius: f64,
+) -> crate::traffic::Resources {
+    let origin = map.origin();
+    let resolution = map.resolution_meters();
+    let radius = radius + SAFETY_EPSILON_METERS;
+    let min_x = ((start.x_meters().min(end.x_meters()) - radius - origin.x_meters()) / resolution)
+        .floor() as i64;
+    let max_x = ((start.x_meters().max(end.x_meters()) + radius - origin.x_meters()) / resolution)
+        .floor() as i64;
+    let min_y = ((start.y_meters().min(end.y_meters()) - radius - origin.y_meters()) / resolution)
+        .floor() as i64;
+    let max_y = ((start.y_meters().max(end.y_meters()) + radius - origin.y_meters()) / resolution)
+        .floor() as i64;
+    let mut resources = crate::traffic::Resources::new();
+    for x in min_x.max(0)..=max_x.min(i64::from(map.width()) - 1) {
+        for y in min_y.max(0)..=max_y.min(i64::from(map.height()) - 1) {
+            resources.extend(crate::traffic::corridor_resources(
+                map,
+                (x as u32, y as u32),
+            ));
+        }
+    }
+    resources
+}
+
+fn passage_motion_resources<C: MonotonicClock + Clone>(
+    engine: &SimulationEngine<C>,
+    action: i32,
+    target: Option<MotionTarget>,
+    radius: f64,
+) -> Result<(crate::traffic::Resources, bool), FleetError> {
+    let mut preview = engine.clone();
+    let record = preview
+        .step_with_target(action, target)
+        .map_err(FleetError::Engine)?;
+    let next = record.state;
+    let limits = engine.motion_limits();
+    // Bound interpolation between the endpoints of the actual next tick.
+    let margin = limits
+        .max_acceleration_mps2()
+        .max(limits.max_deceleration_mps2())
+        .max(limits.max_emergency_deceleration_mps2())
+        * crate::types::CONTROL_TICK_SECONDS.powi(2)
+        / 8.0;
+    let mut resources = passage_segment_resources(
+        engine.map(),
+        engine.state().position(),
+        next.position(),
+        radius + margin,
+    );
+    // Reserve both ordinary and emergency stops, without assuming future grants
+    // or continued motion by the leader.
+    for (index, (deceleration, jerk)) in [
+        (limits.max_deceleration_mps2(), limits.max_jerk_mps3()),
+        (
+            limits.max_emergency_deceleration_mps2(),
+            limits.max_emergency_jerk_mps3(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A latched emergency continues the stronger braking profile; switching
+        // back to ordinary limits can be kinematically impossible.
+        if index == 0 && record.safety_outcome == crate::safety::SafetyOutcome::EmergencyStop {
+            continue;
+        }
+        let segments = crate::motion::preview_stop_trajectory(next, deceleration, jerk, limits)
+            .map_err(|_| FleetError::CollisionInvariant)?;
+        for segment in segments {
+            resources.extend(passage_segment_resources(
+                engine.map(),
+                segment.start,
+                segment.end,
+                radius + segment.curvature_margin_meters,
+            ));
+        }
+    }
+    Ok((
+        resources,
+        record.safety_outcome == crate::safety::SafetyOutcome::EmergencyStop,
+    ))
+}
+
+// The endpoint is the next required stop, possibly beyond intermediate straight nodes.
+// Replay the same deterministic target controller over the existing 2s horizon,
+// checking every swept tick. A failed forecast is treated as a conflict.
+fn targeted_prediction_distance_squared<C: MonotonicClock + Clone>(
+    left: &SimulationEngine<C>,
+    right: &SimulationEngine<C>,
+    left_action: i32,
+    right_action: i32,
+    left_target: Option<MotionTarget>,
+    right_target: Option<MotionTarget>,
+) -> f64 {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    let mut distance = f64::INFINITY;
+    for _ in 0..20 {
+        let left_start = left.state();
+        let right_start = right.state();
+        let (Ok(left_next), Ok(right_next)) = (
+            left.step_with_target(left_action, left_target),
+            right.step_with_target(right_action, right_target),
+        ) else {
+            return 0.0;
+        };
+        distance = distance.min(simultaneous_segment_distance_squared(
+            left_start,
+            left_next.state,
+            right_start,
+            right_next.state,
+        ));
+    }
+    distance
 }
 
 fn constant_velocity_distance_squared(
@@ -644,6 +1042,7 @@ fn validate_pairwise_states<'a>(
 
 #[derive(Debug)]
 pub enum FleetError {
+    Map(crate::world::MapError),
     EmptyFleet,
     DuplicateRobot,
     UnknownRobot,
@@ -669,6 +1068,7 @@ impl From<PlanError> for FleetError {
 impl fmt::Display for FleetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Map(error) => error.fmt(formatter),
             Self::EmptyFleet => {
                 formatter.write_str("multi-robot engine requires at least one robot")
             }
@@ -694,3 +1094,18 @@ impl fmt::Display for FleetError {
 }
 
 impl std::error::Error for FleetError {}
+
+#[cfg(test)]
+mod passage_tests {
+    use super::*;
+    #[test]
+    fn rear_cell_stays_until_entire_safety_footprint_clears() {
+        let map = crate::world::GridMap::new(9, 7, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, [])
+            .unwrap();
+        let touching = WorldPosition::new(2.25, 3.5).unwrap();
+        assert!(passage_segment_resources(&map, touching, touching, 0.25).contains(&(1, 3)));
+        let cleared = WorldPosition::new(2.26, 3.5).unwrap();
+        assert!(!passage_segment_resources(&map, cleared, cleared, 0.25).contains(&(1, 3)));
+        assert!(passage_segment_resources(&map, cleared, cleared, 0.25).contains(&(2, 3)));
+    }
+}

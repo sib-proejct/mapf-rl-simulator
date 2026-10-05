@@ -16,6 +16,10 @@ pub struct Phase2Runtime {
     client: CoreClient,
     session: Arc<Mutex<CoreSession>>,
     websocket: Option<CoreWebSocket>,
+    telemetry: Option<crate::telemetry::TelemetryTransport>,
+    telemetry_sequence: u64,
+    durable_fingerprint: Option<serde_json::Value>,
+    durable_state_version: Option<u64>,
 }
 
 pub struct IncidentReport {
@@ -38,6 +42,10 @@ impl Phase2Runtime {
             client: self.client.clone(),
             session: Arc::clone(&self.session),
             websocket: None,
+            telemetry: None,
+            telemetry_sequence: 0,
+            durable_fingerprint: None,
+            durable_state_version: None,
         };
         tokio::spawn(async move {
             worker.connect_and_replay(monotonic_ms).await?;
@@ -50,6 +58,10 @@ impl Phase2Runtime {
             client,
             session: Arc::new(Mutex::new(session)),
             websocket: None,
+            telemetry: None,
+            telemetry_sequence: 0,
+            durable_fingerprint: None,
+            durable_state_version: None,
         }
     }
 
@@ -88,6 +100,7 @@ impl Phase2Runtime {
         let resume_after = self
             .session_call(|session| Ok(session.resume_after()))
             .await?;
+        self.client.require_occupancy_control().await?;
         let mut websocket = self.client.connect_websocket(resume_after).await?;
         let welcome_value = websocket.next_json().await?;
         let welcome: StreamWelcome = serde_json::from_value(welcome_value)?;
@@ -105,6 +118,11 @@ impl Phase2Runtime {
             websocket.write_report(report).await?;
         }
         self.websocket = Some(websocket);
+        if self.client.telemetry_supported().await? {
+            self.telemetry = Some(crate::telemetry::TelemetryTransport::start(
+                self.client.clone(),
+            ));
+        }
         Ok(snapshot)
     }
 
@@ -118,35 +136,96 @@ impl Phase2Runtime {
         pose: PoseReport,
         occurred_at: String,
     ) -> Result<bool, RuntimeError> {
+        self.publish_state(
+            monotonic_ms,
+            state_version,
+            simulation_time_ms,
+            pose,
+            occurred_at,
+            false,
+        )
+        .await
+    }
+
+    /// Publish current physical evidence before a critical lifecycle transition.
+    pub async fn publish_state_now(
+        &mut self,
+        monotonic_ms: u64,
+        state_version: u64,
+        simulation_time_ms: i64,
+        pose: PoseReport,
+        occurred_at: String,
+    ) -> Result<bool, RuntimeError> {
+        self.publish_state(
+            monotonic_ms,
+            state_version,
+            simulation_time_ms,
+            pose,
+            occurred_at,
+            true,
+        )
+        .await
+    }
+
+    async fn publish_state(
+        &mut self,
+        monotonic_ms: u64,
+        state_version: u64,
+        simulation_time_ms: i64,
+        pose: PoseReport,
+        occurred_at: String,
+        force: bool,
+    ) -> Result<bool, RuntimeError> {
+        if force && self.durable_state_version == Some(state_version) {
+            return Ok(false);
+        }
         let report = self
             .session_call(move |session| {
-                if !session.state_report_due(monotonic_ms) {
+                if !force && !session.state_report_due(monotonic_ms) {
                     return Ok(None);
                 }
-                let message_id = session.queue_state_report(
+                Ok(Some(session.build_state_report(
                     state_version,
                     simulation_time_ms,
                     pose,
                     occurred_at,
-                )?;
-                Ok(session
-                    .spool()
-                    .pending()
-                    .iter()
-                    .find(|report| report.message_id == message_id)
-                    .cloned())
+                )?))
             })
             .await?;
         let Some(report) = report else {
             return Ok(false);
         };
-        let Some(websocket) = self.websocket.as_mut() else {
-            return Ok(true);
-        };
-        if let Err(error) = websocket.write_report(&report).await {
-            self.websocket = None;
-            self.mark_disconnected(monotonic_ms).await?;
-            return Err(error.into());
+        let payload = serde_json::to_value(&report.payload)?;
+        let fingerprint = crate::telemetry::durable_fingerprint(&payload);
+        if self.telemetry.is_none()
+            || force
+            || self.durable_fingerprint.as_ref() != Some(&fingerprint)
+        {
+            let queued = report.clone();
+            self.session_call(move |session| Ok(session.enqueue_state_report(queued)?))
+                .await?;
+            let Some(socket) = self.websocket.as_mut() else {
+                return Ok(true);
+            };
+            if let Err(error) = socket.write_report(&report).await {
+                self.websocket = None;
+                self.mark_disconnected(monotonic_ms).await?;
+                return Err(error.into());
+            }
+            self.durable_state_version = Some(state_version);
+            self.durable_fingerprint = Some(fingerprint);
+        }
+        if let Some(transport) = &self.telemetry {
+            let frame = serde_json::json!({
+                "telemetryVersion": crate::contracts::generated::TELEMETRY_VERSION,
+                "messageType": "telemetry.report", "simulatorId": report.simulator_id,
+                "robotId": report.robot_id, "sessionEpoch": report.session_epoch,
+                "simulatorBootId": report.simulator_boot_id,
+                "telemetrySequence": self.telemetry_sequence,
+                "occurredAt": report.occurred_at, "payload": payload,
+            });
+            self.telemetry_sequence += 1;
+            transport.publish(frame);
         }
         Ok(true)
     }
@@ -162,11 +241,27 @@ impl Phase2Runtime {
         })
         .await
     }
-    pub async fn synchronized(&self) -> Result<bool, RuntimeError> {
-        self.session_call(|session| {
-            Ok(session.state() == crate::session::SessionState::Synchronized)
+    pub async fn set_traffic_wait(
+        &mut self,
+        wait: Option<crate::contracts::provisioning_generated::TrafficWait>,
+    ) -> Result<(), RuntimeError> {
+        self.session_call(move |session| {
+            session.set_traffic_wait(wait);
+            Ok(())
         })
         .await
+    }
+    pub async fn synchronized(&self) -> Result<bool, RuntimeError> {
+        let synchronized = self
+            .session_call(|session| {
+                Ok(session.state() == crate::session::SessionState::Synchronized)
+            })
+            .await?;
+        Ok(synchronized
+            && self
+                .telemetry
+                .as_ref()
+                .is_none_or(|transport| transport.ready()))
     }
 
     pub async fn publish_order_completed(
@@ -426,7 +521,7 @@ impl Phase2Runtime {
 
     /// Five-second REST recovery path. It validates the authenticated snapshot and
     /// submits bounded batches, applying the same Core acceptance rules as WS acks.
-    /// It never substitutes REST for 10 Hz telemetry generation.
+    /// It never substitutes REST for 5 Hz telemetry generation.
     pub async fn run_rest_fallback_if_due(&self, monotonic_ms: u64) -> Result<bool, RuntimeError> {
         let due = self
             .session_call(move |session| Ok(session.rest_fallback_due(monotonic_ms)))
@@ -495,7 +590,7 @@ impl Phase2Runtime {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeEvent {
     Order {
         decision: OrderDecision,
