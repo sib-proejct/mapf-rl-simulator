@@ -16,6 +16,7 @@ pub enum RecoveryReason {
     CorridorConflict,
     Deadlock,
     RobotFailure,
+    StationaryBlocked,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +71,7 @@ impl FleetConfig {
 pub struct MultiRobotEngine<C> {
     passage_rights: crate::traffic::PassageRights,
     passage_targets: BTreeMap<RobotId, MotionTarget>,
+    stationary_waits: BTreeMap<String, (Option<uuid::Uuid>, BTreeSet<String>, u32)>,
     robots: BTreeMap<RobotId, SimulationEngine<C>>,
     config: FleetConfig,
     no_progress_ticks: u32,
@@ -97,6 +99,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         Ok(Self {
             passage_rights: crate::traffic::PassageRights::default(),
             passage_targets: BTreeMap::new(),
+            stationary_waits: BTreeMap::new(),
             robots: ordered,
             config,
             no_progress_ticks: 0,
@@ -255,6 +258,7 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         self.robots = restored;
         self.passage_rights = crate::traffic::PassageRights::default();
         self.passage_targets.clear();
+        self.stationary_waits.clear();
         self.no_progress_ticks = checkpoint.no_progress_ticks;
         Ok(checkpoint.plans.clone())
     }
@@ -505,6 +509,67 @@ impl<C: MonotonicClock + Clone> MultiRobotEngine<C> {
         let mut step =
             self.step_with_independent_motion_targets(&actions, &allowed_targets, plans)?;
         step.traffic_wait = allocation.blockers;
+        // A parked blocker cannot release its resources by waiting. Count only
+        // stopped requests against blockers without motion authority.
+        let mut stationary_blocked = Vec::new();
+        self.stationary_waits
+            .retain(|id, _| step.traffic_wait.contains_key(id));
+        for (id, blockers) in &step.traffic_wait {
+            let robot_id = RobotId::new(id.clone()).map_err(|_| FleetError::CollisionInvariant)?;
+            let stopped = |state: RobotState| {
+                state.velocity().magnitude() < 1e-6 && state.acceleration().magnitude() < 1e-6
+            };
+            let parked: BTreeSet<_> = blockers
+                .iter()
+                .filter(|blocker| {
+                    self.robots.iter().any(|(key, engine)| {
+                        key.as_str() == blocker.as_str()
+                            && stopped(engine.state())
+                            && !plans
+                                .get(key)
+                                .is_some_and(|plan| plan.motion_authorized(blocker))
+                    })
+                })
+                .cloned()
+                .collect();
+            if parked.is_empty()
+                || !stopped(self.robots[&robot_id].state())
+                || !plans
+                    .get(&robot_id)
+                    .is_some_and(|plan| plan.motion_authorized(id))
+            {
+                self.stationary_waits.remove(id);
+                continue;
+            }
+            let revision = plans[&robot_id].active_revision_id();
+            let wait =
+                self.stationary_waits
+                    .entry(id.clone())
+                    .or_insert((revision, parked.clone(), 0));
+            if wait.0 != revision || wait.1 != parked {
+                *wait = (revision, parked, 0);
+            }
+            wait.2 = wait.2.saturating_add(1);
+            if wait.2 >= self.config.deadlock_ticks {
+                stationary_blocked.push(id.clone());
+            }
+        }
+        if allocation.cycle.is_empty() && step.recovery.is_none() && !stationary_blocked.is_empty()
+        {
+            for id in &stationary_blocked {
+                let key = RobotId::new(id.clone()).map_err(|_| FleetError::CollisionInvariant)?;
+                plans
+                    .get_mut(&key)
+                    .expect("authorized plan")
+                    .hold_for_recovery(None)?;
+                self.stationary_waits.remove(id);
+            }
+            step.recovery = Some(RecoveryEvent {
+                reason: RecoveryReason::StationaryBlocked,
+                held_robots: stationary_blocked,
+                replan_required: true,
+            });
+        }
         if !allocation.cycle.is_empty() {
             let held_robots: Vec<_> = allocation.cycle.into_iter().collect();
             for id in &held_robots {

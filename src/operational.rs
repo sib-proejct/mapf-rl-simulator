@@ -309,6 +309,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                         RecoveryReason::CorridorConflict => "CORRIDOR_CONFLICT",
                         RecoveryReason::Deadlock => "DEADLOCK_DETECTED",
                         RecoveryReason::RobotFailure => "ROBOT_FAILURE",
+                        RecoveryReason::StationaryBlocked => "SAFETY_STATIONARY_BLOCKED",
                     };
                     (code, recovery.held_robots.clone())
                 };

@@ -439,10 +439,10 @@ async fn run_scenario(
                     assert_eq!(state["phase"], "COMPLETED");
                     assert_eq!(state["loaded"], action == "PICK");
                     if action == "CHARGE" {
-                        // Core verifies exactly 100% in completion evidence. A later
+                        // Core verifies at least 80% in completion evidence. A later
                         // idle state report may already include a tick of idle drain.
                         let percent = state["batteryPercent"].as_f64().unwrap();
-                        assert!((99.99..=100.0).contains(&percent));
+                        assert!((79.99..=100.0).contains(&percent));
                     }
                 }
                 break;

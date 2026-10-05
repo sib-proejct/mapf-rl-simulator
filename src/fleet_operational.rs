@@ -391,11 +391,23 @@ impl RobotRuntime {
                     RecoveryReason::CorridorConflict => "CORRIDOR_CONFLICT",
                     RecoveryReason::Deadlock => "DEADLOCK_DETECTED",
                     RecoveryReason::RobotFailure => "ROBOT_FAILURE",
+                    RecoveryReason::StationaryBlocked => "SAFETY_STATIONARY_BLOCKED",
                 };
                 (code, recovery.held_robots.clone())
             };
             let mut evidence = serde_json::Map::new();
             evidence.insert("heldRobots".to_owned(), serde_json::json!(held_robots));
+            if code == "SAFETY_STATIONARY_BLOCKED" {
+                evidence.insert(
+                    "blockingRobotIds".to_owned(),
+                    serde_json::json!(
+                        step.traffic_wait
+                            .get(&config.robot_id)
+                            .cloned()
+                            .unwrap_or_default()
+                    ),
+                );
+            }
             if let Some(order) = &applied {
                 evidence.insert("orderId".to_owned(), order.order_id.clone().into());
                 evidence.insert(
