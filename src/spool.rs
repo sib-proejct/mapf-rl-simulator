@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const SPOOL_FORMAT_VERSION: u32 = 1;
+const SPOOL_FORMAT_VERSION: u32 = 2;
 pub const DEFAULT_REPORT_CAPACITY: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -78,14 +78,16 @@ struct SpoolBody {
     pending_abort: Option<OrderCommand>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     aborted_orders: std::collections::BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    completed_orders: std::collections::BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
-    completed_orders: std::collections::BTreeSet<String>,
+    terminal_orders: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SpoolDocument {
-    body: SpoolBody,
+struct SpoolDocument<B = SpoolBody> {
+    body: B,
     checksum_sha256: String,
 }
 
@@ -117,19 +119,37 @@ impl DurableSpool {
         let path = path.into();
         let body = if path.exists() {
             let bytes = fs::read(&path)?;
-            let document: SpoolDocument = serde_json::from_slice(&bytes)?;
-            let checksum = checksum(&document.body)?;
-            if checksum != document.checksum_sha256
-                || document.body.format_version != SPOOL_FORMAT_VERSION
-                || document.body.simulator_id != simulator_id
-                || document.body.pending.len() > capacity
+            let document: SpoolDocument<serde_json::Value> = serde_json::from_slice(&bytes)?;
+            let legacy = document
+                .body
+                .get("formatVersion")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1);
+            let mut recovered = if legacy {
+                let body: LegacySpoolBody = serde_json::from_value(document.body)?;
+                if checksum(&body)? != document.checksum_sha256 {
+                    return Err(SpoolError::Corrupt);
+                }
+                body.into_current()
+            } else {
+                let body: SpoolBody = serde_json::from_value(document.body)?;
+                if checksum(&body)? != document.checksum_sha256 {
+                    return Err(SpoolError::Corrupt);
+                }
+                body
+            };
+            if recovered.format_version != SPOOL_FORMAT_VERSION
+                || recovered.simulator_id != simulator_id
+                || recovered.pending.len() > capacity
             {
                 return Err(SpoolError::Corrupt);
             }
-            for report in &document.body.pending {
+            for report in &recovered.pending {
                 report.validate().map_err(|_| SpoolError::Corrupt)?;
             }
-            let mut recovered = document.body;
+            if legacy {
+                preserve_legacy_spool(&path, &bytes)?;
+            }
             // PREPARE and plan activation authority never survive a process boot.
             // The safety checkpoint retains their identities for reconciliation,
             // but the command spool cannot use them to resume motion.
@@ -159,7 +179,8 @@ impl DurableSpool {
                 prepared_order: None,
                 pending_abort: None,
                 aborted_orders: std::collections::BTreeMap::new(),
-                completed_orders: std::collections::BTreeSet::new(),
+                completed_orders: std::collections::BTreeMap::new(),
+                terminal_orders: std::collections::BTreeSet::new(),
             }
         };
         let spool = Self {
@@ -207,8 +228,21 @@ impl DurableSpool {
         self.body.pending_abort.as_ref()
     }
 
-    pub fn was_completed(&self, order_id: &str) -> bool {
-        self.body.completed_orders.contains(order_id)
+    pub fn was_completed(&self, order_id: &str, update_id: u64) -> bool {
+        self.was_order_completed(order_id)
+            || self
+                .body
+                .completed_orders
+                .get(order_id)
+                .is_some_and(|version| update_id <= *version)
+    }
+
+    pub fn was_order_completed(&self, order_id: &str) -> bool {
+        self.body.terminal_orders.contains(order_id)
+    }
+
+    pub fn completed_version(&self, order_id: &str) -> Option<u64> {
+        self.body.completed_orders.get(order_id).copied()
     }
 
     pub fn was_aborted(&self, order_id: &str, update_id: u64) -> bool {
@@ -441,7 +475,21 @@ impl DurableSpool {
                     .get("orderId")
                     .and_then(serde_json::Value::as_str)
             {
-                self.body.completed_orders.insert(order_id.to_owned());
+                let order_update_id = event
+                    .evidence
+                    .get("orderUpdateId")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                self.body
+                    .completed_orders
+                    .entry(order_id.to_owned())
+                    .and_modify(|version| *version = (*version).max(order_update_id))
+                    .or_insert(order_update_id);
+                // Only Core can distinguish a recovery step from terminal completion.
+                // Legacy or unknown success codes retain the old terminal semantics.
+                if code != "ORDER_RECOVERY_STEP_COMPLETED" {
+                    self.body.terminal_orders.insert(order_id.to_owned());
+                }
             }
             if clears_applied_order {
                 self.body.applied_order = None;
@@ -590,7 +638,7 @@ impl std::error::Error for SpoolError {
     }
 }
 
-fn checksum(body: &SpoolBody) -> Result<String, serde_json::Error> {
+fn checksum(body: &impl Serialize) -> Result<String, serde_json::Error> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(body)?)))
 }
 
@@ -616,4 +664,95 @@ fn validate_uuid_v4(value: Uuid) -> Result<(), SpoolError> {
 
 const fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+// Frozen v1 representation: checksum verification must precede conversion,
+// including for the intermediate v1 writer that used a map instead of a set.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacySpoolBody {
+    format_version: u32,
+    simulator_id: String,
+    current_boot_id: Uuid,
+    next_report_sequence: u64,
+    pending: Vec<ReportEnvelope>,
+    dead_letters: Vec<DeadLetter>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    dead_letters_dropped: u64,
+    applied_order: Option<AppliedOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_order: Option<PreparedOrder>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_abort: Option<OrderCommand>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    aborted_orders: std::collections::BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "LegacyCompletedOrders::is_empty")]
+    completed_orders: LegacyCompletedOrders,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum LegacyCompletedOrders {
+    Map(std::collections::BTreeMap<String, u64>),
+    Set(std::collections::BTreeSet<String>),
+}
+
+impl Default for LegacyCompletedOrders {
+    fn default() -> Self {
+        Self::Map(std::collections::BTreeMap::new())
+    }
+}
+
+impl LegacyCompletedOrders {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Map(map) => map.is_empty(),
+            Self::Set(set) => set.is_empty(),
+        }
+    }
+}
+
+impl LegacySpoolBody {
+    fn into_current(self) -> SpoolBody {
+        let completed_orders = match self.completed_orders {
+            LegacyCompletedOrders::Map(map) => map,
+            LegacyCompletedOrders::Set(set) => set.into_iter().map(|id| (id, u64::MAX)).collect(),
+        };
+        SpoolBody {
+            format_version: SPOOL_FORMAT_VERSION,
+            simulator_id: self.simulator_id,
+            current_boot_id: self.current_boot_id,
+            next_report_sequence: self.next_report_sequence,
+            pending: self.pending,
+            dead_letters: self.dead_letters,
+            dead_letters_dropped: self.dead_letters_dropped,
+            applied_order: self.applied_order,
+            prepared_order: self.prepared_order,
+            pending_abort: self.pending_abort,
+            aborted_orders: self.aborted_orders,
+            terminal_orders: completed_orders.keys().cloned().collect(),
+            completed_orders,
+        }
+    }
+}
+
+fn preserve_legacy_spool(path: &Path, bytes: &[u8]) -> Result<(), SpoolError> {
+    let mut backup_name = path.as_os_str().to_os_string();
+    backup_name.push(".v1.bak");
+    let backup = PathBuf::from(backup_name);
+    // Linking preserves the complete old inode atomically; persist replaces the
+    // live path with a new inode and never modifies this backup.
+    match fs::hard_link(path, &backup) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // A crash after backup but before conversion may retry the migration.
+            if fs::read(&backup)? != bytes {
+                return Err(error.into());
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    File::open(&backup)?.sync_all()?;
+    File::open(path.parent().ok_or(SpoolError::InvalidPath)?)?.sync_all()?;
+    Ok(())
 }

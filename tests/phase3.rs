@@ -1375,3 +1375,91 @@ fn target_on_a_parked_robot_still_triggers_collision_recovery() {
     assert!(!plans[&r1].motion_authorized("r1"));
     assert!(fleet.robots()[&r1].state().position().x_meters() < 4.0);
 }
+
+#[test]
+fn completion_scope_survives_restart_and_fences_prepare_activate() {
+    use mapf_rl_simulator::protocol::{
+        ReportBatchItemOutcome, ReportBatchOutcome, ReportDisposition, ReportDurability,
+    };
+    for recovery in [true, false] {
+        let temp = TempDir::new().unwrap();
+        let map = MapIdentity {
+            map_id: Uuid::new_v4(),
+            revision: 1,
+            content_digest_sha256: "d".repeat(64),
+        };
+        let mut session = synchronized_session(&temp, map.clone());
+        let mut command = plan_command(map.clone(), Uuid::new_v4(), OrderPhase::Prepare);
+        assert_eq!(
+            session
+                .accept_order_at(&command, NOW.to_owned(), 100, true)
+                .unwrap()
+                .code,
+            "PLAN_PREPARED"
+        );
+        command.payload.phase = OrderPhase::Activate;
+        command.payload.command_id = Uuid::new_v4();
+        assert!(
+            session
+                .accept_order_at(&command, NOW.to_owned(), 101, true)
+                .unwrap()
+                .apply_to_robot
+        );
+        session.queue_order_completed(500, NOW.to_owned()).unwrap();
+        let completion = session.spool().pending().last().unwrap();
+        let outcome = ReportBatchOutcome {
+            request_id: Uuid::new_v4(),
+            outcomes: vec![ReportBatchItemOutcome {
+                report_message_id: completion.message_id,
+                report_sequence: completion.report_sequence,
+                disposition: ReportDisposition::Accepted,
+                durability: ReportDurability::Durable,
+                retryable: false,
+                code: if recovery {
+                    "ORDER_RECOVERY_STEP_COMPLETED"
+                } else {
+                    "ORDER_TERMINAL_COMPLETED"
+                }
+                .to_owned(),
+            }],
+        };
+        session.accept_report_batch(&outcome).unwrap();
+        drop(session);
+        let mut restarted = synchronized_session(&temp, map.clone());
+        command.payload.phase = OrderPhase::Prepare;
+        assert_eq!(
+            restarted
+                .accept_order_at(&command, NOW.to_owned(), 200, true)
+                .unwrap()
+                .code,
+            "ORDER_ALREADY_COMPLETED"
+        );
+        let mut next = plan_command(map, Uuid::new_v4(), OrderPhase::Prepare);
+        next.payload.order_update_id = 410;
+        let prepared = restarted
+            .accept_order_at(&next, NOW.to_owned(), 201, true)
+            .unwrap();
+        assert_eq!(
+            prepared.code,
+            if recovery {
+                "PLAN_PREPARED"
+            } else {
+                "ORDER_ALREADY_COMPLETED"
+            }
+        );
+        next.payload.phase = OrderPhase::Activate;
+        next.payload.command_id = Uuid::new_v4();
+        let activated = restarted
+            .accept_order_at(&next, NOW.to_owned(), 202, true)
+            .unwrap();
+        assert_eq!(activated.apply_to_robot, recovery);
+        assert_eq!(
+            activated.code,
+            if recovery {
+                "PLAN_ACTIVATED"
+            } else {
+                "ORDER_ALREADY_COMPLETED"
+            }
+        );
+    }
+}

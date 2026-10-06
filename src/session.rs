@@ -581,7 +581,10 @@ impl CoreSession {
     }
 
     fn classify_order(&self, command: &OrderCommand, stationary: bool) -> OrderDecision {
-        if self.spool.was_completed(&command.payload.order_id) {
+        if self
+            .spool
+            .was_completed(&command.payload.order_id, command.payload.order_update_id)
+        {
             return rejected("ORDER_ALREADY_COMPLETED");
         }
         if command.payload.phase != OrderPhase::Abort
@@ -722,7 +725,12 @@ impl CoreSession {
 
     fn classify_update(&self, command: &OrderCommand) -> OrderDecision {
         let Some(current) = self.spool.applied_order() else {
-            return if command.payload.order_update_id == 0 {
+            let acceptable = command.payload.order_update_id == 0
+                || self
+                    .spool
+                    .completed_version(&command.payload.order_id)
+                    .is_some_and(|completed| command.payload.order_update_id > completed);
+            return if acceptable {
                 OrderDecision {
                     apply_to_robot: true,
                     disposition: CommandDisposition::Applied,
