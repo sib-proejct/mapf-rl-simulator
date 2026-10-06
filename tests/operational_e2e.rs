@@ -538,8 +538,25 @@ async fn run_scenario(
             );
             sleep(Duration::from_millis(100)).await;
         }
-        // Stay alive past the original lease/watchdog window.
+        // Verify request reduction while staying alive past the watchdog window.
+        let before: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("runtime-counts.json")).unwrap())
+                .unwrap();
         sleep(Duration::from_secs(11)).await;
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("runtime-counts.json")).unwrap())
+                .unwrap();
+        for path in [
+            "/api/v1/runtime/provisioning/claim",
+            "/api/v1/runtime/motion-profiles",
+            "/api/v1/runtime/robot-removals/sync",
+        ] {
+            let calls = after[path].as_u64().unwrap() - before[path].as_u64().unwrap();
+            assert!(
+                (2..=4).contains(&calls),
+                "unexpected sync cadence for {path}: {calls}"
+            );
+        }
         assert!(simulator.0.try_wait().unwrap().is_none());
         let checkpoint: serde_json::Value =
             serde_json::from_slice(&fs::read(temp.path().join("fleet-checkpoint.json")).unwrap())
@@ -551,6 +568,115 @@ async fn run_scenario(
                 .len(),
             2
         );
+        let profiles: serde_json::Value = client
+            .get(format!("{rest_base}api/v1/motion-profiles"))
+            .header("Cookie", "__Host-mapf_session=operator-session")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let version = profiles["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["robotId"] == robot_id)
+            .unwrap()["version"]
+            .as_u64()
+            .unwrap();
+        let saved = client
+            .post(format!("{rest_base}api/v1/motion-profiles"))
+            .header("Cookie", "__Host-mapf_session=operator-session")
+            .header("X-CSRF-Token", "csrf-token")
+            .json(
+                &json!({"contractVersion": "1.0.0", "requestId": Uuid::new_v4(),
+                "targets": [{"robotId": robot_id, "version": version}],
+                "limits": {"maxLinearSpeedMps": 1.0, "maxLinearAccelerationMps2": 1.0,
+                    "maxLinearDecelerationMps2": 1.5, "maxLinearJerkMps3": 3.0}}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            saved.status().is_success(),
+            "profile save failed: {}",
+            saved.text().await.unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let profiles: serde_json::Value = client
+                .get(format!("{rest_base}api/v1/motion-profiles"))
+                .header("Cookie", "__Host-mapf_session=operator-session")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let applied = profiles["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|profile| profile["robotId"] == robot_id)
+                .unwrap();
+            if applied["appliedVersion"].as_u64() == Some(version + 1) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "profile ACK did not arrive: {applied}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+        let removed = client
+            .post(format!("{rest_base}api/v1/robots/{robot_id}/remove"))
+            .header("Cookie", "__Host-mapf_session=operator-session")
+            .header("X-CSRF-Token", "csrf-token")
+            .json(&json!({"contractVersion": "1.0.0", "requestId": Uuid::new_v4()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::ACCEPTED);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status: serde_json::Value = client
+                .get(format!("{rest_base}api/v1/robots/{robot_id}/removal"))
+                .header("Cookie", "__Host-mapf_session=operator-session")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if status["state"] == "REMOVED" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "robot removal did not complete: {status}"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert!(simulator.0.try_wait().unwrap().is_none());
+
+        // All runtime responses succeed within their 3s timeout. Configuration
+        // latency must not delay the independent lease heartbeat past its watchdog.
+        let before: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("runtime-counts.json")).unwrap())
+                .unwrap();
+        fs::write(temp.path().join("delay-runtime-responses"), "").unwrap();
+        sleep(Duration::from_secs(11)).await;
+        assert!(
+            simulator.0.try_wait().unwrap().is_none(),
+            "slow configuration responses stopped the fleet"
+        );
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("runtime-counts.json")).unwrap())
+                .unwrap();
+        let claim_path = "/api/v1/runtime/provisioning/claim";
+        assert!(after[claim_path].as_u64().unwrap() - before[claim_path].as_u64().unwrap() >= 3);
+        fs::remove_file(temp.path().join("delay-runtime-responses")).unwrap();
     }
     if station_actions || fleet_mode {
         simulator.0.kill().unwrap();

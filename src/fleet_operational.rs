@@ -768,13 +768,16 @@ impl Provisioner {
         &self,
         mut known: BTreeSet<String>,
         claims: tokio::sync::mpsc::UnboundedSender<Vec<RuntimeRobotClaim>>,
-        removals: tokio::sync::mpsc::UnboundedSender<Vec<RobotRemovalOutcome>>,
         started: Instant,
         renewed_ms: &AtomicU64,
-        mut sync: ProfileSync,
     ) -> Result<(), Box<dyn Error>> {
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            Duration::from_secs(3),
+        );
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            interval.tick().await;
             let request_started = elapsed_milliseconds(started);
             match self.claim(known.iter().cloned().collect()).await {
                 Ok(robots) => {
@@ -788,6 +791,16 @@ impl Provisioner {
                 }
                 Err(error) => eprintln!("fleet lease renewal failed: {error}"),
             }
+        }
+    }
+
+    async fn sync_configuration(
+        &self,
+        removals: tokio::sync::mpsc::UnboundedSender<Vec<RobotRemovalOutcome>>,
+        mut sync: ProfileSync,
+    ) -> Result<(), Box<dyn Error>> {
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
             while let Ok(targets) = sync.applied_rx.try_recv() {
                 if let Err(error) = self.acknowledge_profiles(targets).await {
                     eprintln!("motion profile acknowledgement failed: {error}");
@@ -1125,7 +1138,8 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     tokio::select! {
         biased;
         _ = lease_expired(started, &renewed_ms) => Err(invalid("local fleet runtime lease was lost").into()),
-        result = heartbeat.renew_lease(known, claims_tx, removals_tx, started, &renewed_ms, ProfileSync { profiles_tx, applied_rx }) => result,
+        result = heartbeat.renew_lease(known, claims_tx, started, &renewed_ms) => result,
+        result = heartbeat.sync_configuration(removals_tx, ProfileSync { profiles_tx, applied_rx }) => result,
         result = run_fleet(
             base,
             provisioner,
