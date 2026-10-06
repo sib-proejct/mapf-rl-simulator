@@ -45,7 +45,23 @@ impl TelemetryTransport {
                             }
                             sent = Some(frame.clone());
                         }
-                        match socket.poll_json().await {
+                        let message = tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                                confirmed + Duration::from_secs(3),
+                            )) => break,
+                            changed = receiver.changed() => {
+                                if changed.is_err() { return; }
+                                continue;
+                            }
+                            message = socket.read_frame() => message,
+                        };
+                        // Never cancel Ping/Pong writes when a publication arrives.
+                        let message = match message {
+                            Ok(frame) => socket.handle_frame(frame).await,
+                            Err(error) => Err(error),
+                        };
+                        match message {
                             Ok(Some(ack)) => {
                                 let Some(frame) = sent.as_ref() else {
                                     break;
@@ -80,7 +96,6 @@ impl TelemetryTransport {
                         if confirmed.elapsed() >= Duration::from_secs(3) {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
                 worker_ready.store(false, Ordering::Release);

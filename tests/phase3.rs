@@ -810,6 +810,26 @@ fn fractional_motion_checkpoint_roundtrip_preserves_checksum_and_pose() {
     );
     let checkpoint = checkpoint.with_station_state("r1".to_owned(), station.clone());
     store.save(&checkpoint).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let path = temp.path().join("safety.json");
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        store.clone().save(&checkpoint).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let mut changed = checkpoint.clone();
+        changed.robots[0].tick += 1;
+        changed.robots[0].simulation_time_ms += 100;
+        store.save(&changed).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+        // A failed replacement must not become the cached successful state.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(store.save(&checkpoint).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        store.save(&checkpoint).unwrap();
+        assert!(path.is_file());
+    }
     let recovered = store
         .load_for_restart("sim-1", &"b".repeat(64))
         .unwrap()
@@ -1354,4 +1374,92 @@ fn target_on_a_parked_robot_still_triggers_collision_recovery() {
     assert!(recovery.held_robots.contains(&"r1".into()));
     assert!(!plans[&r1].motion_authorized("r1"));
     assert!(fleet.robots()[&r1].state().position().x_meters() < 4.0);
+}
+
+#[test]
+fn completion_scope_survives_restart_and_fences_prepare_activate() {
+    use mapf_rl_simulator::protocol::{
+        ReportBatchItemOutcome, ReportBatchOutcome, ReportDisposition, ReportDurability,
+    };
+    for recovery in [true, false] {
+        let temp = TempDir::new().unwrap();
+        let map = MapIdentity {
+            map_id: Uuid::new_v4(),
+            revision: 1,
+            content_digest_sha256: "d".repeat(64),
+        };
+        let mut session = synchronized_session(&temp, map.clone());
+        let mut command = plan_command(map.clone(), Uuid::new_v4(), OrderPhase::Prepare);
+        assert_eq!(
+            session
+                .accept_order_at(&command, NOW.to_owned(), 100, true)
+                .unwrap()
+                .code,
+            "PLAN_PREPARED"
+        );
+        command.payload.phase = OrderPhase::Activate;
+        command.payload.command_id = Uuid::new_v4();
+        assert!(
+            session
+                .accept_order_at(&command, NOW.to_owned(), 101, true)
+                .unwrap()
+                .apply_to_robot
+        );
+        session.queue_order_completed(500, NOW.to_owned()).unwrap();
+        let completion = session.spool().pending().last().unwrap();
+        let outcome = ReportBatchOutcome {
+            request_id: Uuid::new_v4(),
+            outcomes: vec![ReportBatchItemOutcome {
+                report_message_id: completion.message_id,
+                report_sequence: completion.report_sequence,
+                disposition: ReportDisposition::Accepted,
+                durability: ReportDurability::Durable,
+                retryable: false,
+                code: if recovery {
+                    "ORDER_RECOVERY_STEP_COMPLETED"
+                } else {
+                    "ORDER_TERMINAL_COMPLETED"
+                }
+                .to_owned(),
+            }],
+        };
+        session.accept_report_batch(&outcome).unwrap();
+        drop(session);
+        let mut restarted = synchronized_session(&temp, map.clone());
+        command.payload.phase = OrderPhase::Prepare;
+        assert_eq!(
+            restarted
+                .accept_order_at(&command, NOW.to_owned(), 200, true)
+                .unwrap()
+                .code,
+            "ORDER_ALREADY_COMPLETED"
+        );
+        let mut next = plan_command(map, Uuid::new_v4(), OrderPhase::Prepare);
+        next.payload.order_update_id = 410;
+        let prepared = restarted
+            .accept_order_at(&next, NOW.to_owned(), 201, true)
+            .unwrap();
+        assert_eq!(
+            prepared.code,
+            if recovery {
+                "PLAN_PREPARED"
+            } else {
+                "ORDER_ALREADY_COMPLETED"
+            }
+        );
+        next.payload.phase = OrderPhase::Activate;
+        next.payload.command_id = Uuid::new_v4();
+        let activated = restarted
+            .accept_order_at(&next, NOW.to_owned(), 202, true)
+            .unwrap();
+        assert_eq!(activated.apply_to_robot, recovery);
+        assert_eq!(
+            activated.code,
+            if recovery {
+                "PLAN_ACTIVATED"
+            } else {
+                "ORDER_ALREADY_COMPLETED"
+            }
+        );
+    }
 }

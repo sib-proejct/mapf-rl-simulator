@@ -135,7 +135,7 @@ Roll out compatible Core/migration first, then Simulator, then FE.
 
 ## 배터리 및 자동 충전
 
-배터리 소모와 20% 이하 자동 충전을 지원한다. 진행 중인 작업은 완료한 뒤 충전하며 새 일반 작업은 제한한다. Core가 사용 가능한 충전소에 기존 CHARGE Order를 배정하고 Simulator가 100%까지 충전한다. 0%에서는 안전 정지하며 운영자 복구가 필요하다. 충전소가 없거나 점유 중이면 기다리고 재평가한다. 자세한 계약과 제한은 [Live WS 기능 현황](../mapf-rl-docs/LIVE-WS-CAPABILITIES.md#3-배터리-로직)을 참고한다.
+배터리 소모와 30% 이하 자동 충전을 지원한다. 진행 중인 작업은 완료한 뒤 충전하며 새 일반 작업은 제한한다. Core가 사용 가능한 충전소에 기존 CHARGE Order를 배정하고 Simulator가 80%까지 충전한다. 0%에서는 안전 정지하며 운영자 복구가 필요하다. 충전소가 없거나 점유 중이면 기다리고 재평가한다. 자세한 계약과 제한은 [Live WS 기능 현황](../mapf-rl-docs/LIVE-WS-CAPABILITIES.md#3-배터리-로직)을 참고한다.
 
 | 환경변수 | 기본값 | 단위 |
 |---|---|---|
@@ -194,3 +194,22 @@ leader emergency stop, target-change braking, corridor exits/head-on deadlock,
 forecast wait-cycle recovery,
 cancellation/disconnect braking), plus `cargo test traffic --lib` (atomic contention,
 rolling release/extension and FIFO) and `cargo test passage --lib` (rear clearance).
+
+## Live 메가 맵 초기 fleet
+
+Core의 connection 파일에서 map revision과 base robot 시작 셀을 읽는다. 과거 파일은 revision 1,
+시작 셀 (4,2)로 읽는다. 64×40에서도 기존 동적 맵 로딩·fleet claim·안전 커널을 사용한다.
+Mega seed는 base `r-001`과 pending 9대로 시작하며 신규 robot은 기존 Core provisioning API로만 추가한다.
+초기 10대의 readiness·telemetry 및 재시작 복구를 격리 Compose에서 검증한다. 90대 추가 검증은 수행하지 않는다.
+
+## 단일 서버 맵 활성화
+
+Compose의 local map supervisor는 Core 소유 `local-map-control 1.0.0` 계약을 소비한다.
+Supervisor 프로토콜 구현(`scripts/map_worker.py`)은 Core에서 생성·검증하며 Simulator는 DB나 Redis에 접근하지 않는다.
+한 번에 하나의 Rust fleet 프로세스만 실행한다. STOPPING/FAILED 또는 Core 연결 상실 시 child를 종료하고,
+종료 확인 후 STOPPED를 ACK한다. PREPARING에서는 대상 맵의 안전 초기화·session·claim을 확인하고
+child를 일시정지한 뒤 READY를 ACK한다. ACTIVE가 되면 재개한다.
+
+checkpoint·spool은 맵별·활성화 세대별 경로를 사용한다. 같은 세대의 서버 재시작은 복구하지만 새 맵 활성화는
+이전 실행 파일을 재사용하지 않는다. REST·WebSocket에 활성화 세대를 보내 이전 runtime의 입력을 Core가 거부하게 한다.
+Docker 빌드는 노트북 부하를 줄이기 위해 Rust 컴파일 작업 수를 1로 제한한다.

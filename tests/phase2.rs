@@ -72,6 +72,16 @@ fn snapshot(
 }
 
 fn command(epoch: u64, map: MapIdentity, command_id: Uuid, order_id: &str) -> OrderCommand {
+    command_with_update(epoch, map, command_id, order_id, 0)
+}
+
+fn command_with_update(
+    epoch: u64,
+    map: MapIdentity,
+    command_id: Uuid,
+    order_id: &str,
+    order_update_id: u64,
+) -> OrderCommand {
     OrderCommand {
         contract_version: "1.0.0".to_owned(),
         message_id: Uuid::new_v4(),
@@ -89,7 +99,7 @@ fn command(epoch: u64, map: MapIdentity, command_id: Uuid, order_id: &str) -> Or
         payload: OrderCommandPayload {
             command_id,
             order_id: order_id.to_owned(),
-            order_update_id: 0,
+            order_update_id,
             content_digest_sha256: "b".repeat(64),
             plan_revision_id: None,
             phase: OrderPhase::Activate,
@@ -338,7 +348,8 @@ fn accepted_completion_ack_clears_the_applied_order_checkpoint() {
         AckResult::Removed
     );
     assert!(session.spool().applied_order().is_none());
-    assert!(session.spool().was_completed("order-1"));
+    assert!(session.spool().was_completed("order-1", 0));
+    assert!(session.spool().was_order_completed("order-1"));
     let replay = session
         .accept_order(
             &command(1, map.clone(), Uuid::new_v4(), "order-1"),
@@ -355,6 +366,131 @@ fn accepted_completion_ack_clears_the_applied_order_checkpoint() {
         .unwrap();
     assert!(!replay.apply_to_robot);
     assert_eq!(replay.code, "ORDER_ALREADY_COMPLETED");
+}
+
+#[test]
+fn replan_higher_order_update_is_accepted_after_intermediate_completion() {
+    let temp = TempDir::new().unwrap();
+    let map = map();
+    let mut session = session(&temp, map.clone(), Uuid::new_v4());
+    synchronize(&mut session, 1, map.clone());
+
+    // Step 1: Accept initial order (order_update_id = 0)
+    session
+        .accept_order(
+            &command_with_update(1, map.clone(), Uuid::new_v4(), "order-6", 0),
+            NOW.to_owned(),
+        )
+        .unwrap();
+    assert_eq!(session.spool().applied_order().unwrap().order_update_id, 0);
+
+    // Step 2: Queue completion for update 0 and receive Core ACK
+    session.queue_order_completed(500, NOW.to_owned()).unwrap();
+    let completion = session.spool().pending().last().unwrap();
+    let acknowledgement = ReportAck {
+        contract_version: "1.0.0".to_owned(),
+        message_id: Uuid::new_v4(),
+        message_type: "report.ack".to_owned(),
+        producer: Producer {
+            kind: ProducerKind::Core,
+            id: "core-api".to_owned(),
+        },
+        occurred_at: NOW.to_owned(),
+        correlation_id: completion.correlation_id,
+        stream_id: "simulator:sim-1".to_owned(),
+        event_sequence: 19,
+        session_epoch: 1,
+        simulator_id: "sim-1".to_owned(),
+        payload: ReportAckPayload {
+            report_message_id: completion.message_id,
+            simulator_boot_id: completion.simulator_boot_id,
+            report_sequence: completion.report_sequence,
+            disposition: ReportDisposition::Accepted,
+            durability: ReportDurability::Durable,
+            retryable: false,
+            code: "ORDER_RECOVERY_STEP_COMPLETED".to_owned(),
+        },
+    };
+    assert_eq!(
+        session.accept_report_ack(&acknowledgement).unwrap(),
+        AckResult::Removed
+    );
+    assert!(session.spool().applied_order().is_none());
+    assert!(session.spool().was_completed("order-6", 0));
+    assert!(!session.spool().was_order_completed("order-6"));
+    drop(session);
+    let mut session = self::session(&temp, map.clone(), Uuid::new_v4());
+    synchronize(&mut session, 1, map.clone());
+    assert!(!session.spool().was_order_completed("order-6"));
+
+    // Step 3: Replay of completed update (0) is rejected
+    let stale_replay = session
+        .accept_order(
+            &command_with_update(1, map.clone(), Uuid::new_v4(), "order-6", 0),
+            NOW.to_owned(),
+        )
+        .unwrap();
+    assert!(!stale_replay.apply_to_robot);
+    assert_eq!(stale_replay.code, "ORDER_ALREADY_COMPLETED");
+
+    // Step 4: Core replans with higher order_update_id = 410 -> accepted and applied to robot!
+    let replanned = session
+        .accept_order(
+            &command_with_update(1, map.clone(), Uuid::new_v4(), "order-6", 410),
+            NOW.to_owned(),
+        )
+        .unwrap();
+    assert!(replanned.apply_to_robot);
+    assert_eq!(replanned.code, "COMMAND_APPLIED");
+    assert_eq!(
+        session.spool().applied_order().unwrap().order_update_id,
+        410
+    );
+
+    // Step 5: Complete update 410, and verify replay of 410 is rejected
+    session.queue_order_completed(600, NOW.to_owned()).unwrap();
+    let completion_410 = session.spool().pending().last().unwrap();
+    let mut ack_410 = acknowledgement.clone();
+    ack_410.correlation_id = completion_410.correlation_id;
+    ack_410.payload.simulator_boot_id = completion_410.simulator_boot_id;
+    ack_410.payload.code = "ORDER_TERMINAL_COMPLETED".to_owned();
+    ack_410.payload.report_message_id = completion_410.message_id;
+    ack_410.payload.report_sequence = completion_410.report_sequence;
+    assert_eq!(
+        session.accept_report_ack(&ack_410).unwrap(),
+        AckResult::Removed
+    );
+    assert!(session.spool().applied_order().is_none());
+    assert!(session.spool().was_completed("order-6", 410));
+
+    let replay_410 = session
+        .accept_order(
+            &command_with_update(1, map.clone(), Uuid::new_v4(), "order-6", 410),
+            NOW.to_owned(),
+        )
+        .unwrap();
+    assert!(!replay_410.apply_to_robot);
+    assert_eq!(replay_410.code, "ORDER_ALREADY_COMPLETED");
+
+    // Also verify older version (0) is still rejected
+    let replay_0 = session
+        .accept_order(
+            &command_with_update(1, map.clone(), Uuid::new_v4(), "order-6", 0),
+            NOW.to_owned(),
+        )
+        .unwrap();
+    assert!(!replay_0.apply_to_robot);
+    assert_eq!(replay_0.code, "ORDER_ALREADY_COMPLETED");
+
+    assert!(session.spool().was_order_completed("order-6"));
+    let replay_411 = session
+        .accept_order(
+            &command_with_update(1, map.clone(), Uuid::new_v4(), "order-6", 411),
+            NOW.to_owned(),
+        )
+        .unwrap();
+    assert_eq!(replay_411.code, "ORDER_ALREADY_COMPLETED");
+    assert!(!replay_411.apply_to_robot);
 }
 
 #[test]
@@ -595,4 +731,135 @@ fn volatile_state_construction_never_spools_or_consumes_durable_sequence() {
         .queue_state_report(20, 2000, pose, NOW.to_owned())
         .unwrap();
     assert_eq!(session.spool().pending()[0].report_sequence, 0);
+}
+
+fn completion_ack(session: &CoreSession, code: &str, disposition: ReportDisposition) -> ReportAck {
+    let completion = session.spool().pending().last().unwrap();
+    let mut ack = report_ack(session, disposition);
+    ack.correlation_id = completion.correlation_id;
+    ack.payload.report_message_id = completion.message_id;
+    ack.payload.simulator_boot_id = completion.simulator_boot_id;
+    ack.payload.report_sequence = completion.report_sequence;
+    ack.payload.code = code.to_owned();
+    ack
+}
+
+#[test]
+fn terminal_and_legacy_ack_fence_every_version_after_restart() {
+    for code in [
+        "ORDER_TERMINAL_COMPLETED",
+        "REPORT_ACCEPTED",
+        "REPORT_DUPLICATE",
+        "UNKNOWN_SUCCESS",
+    ] {
+        for disposition in [ReportDisposition::Accepted, ReportDisposition::Duplicate] {
+            let temp = TempDir::new().unwrap();
+            let map = map();
+            let mut session = session(&temp, map.clone(), Uuid::new_v4());
+            synchronize(&mut session, 1, map.clone());
+            session
+                .accept_order(
+                    &command(1, map.clone(), Uuid::new_v4(), "order-1"),
+                    NOW.to_owned(),
+                )
+                .unwrap();
+            session.queue_order_completed(500, NOW.to_owned()).unwrap();
+            let ack = completion_ack(&session, code, disposition);
+            session.accept_report_ack(&ack).unwrap();
+            assert_eq!(session.accept_report_ack(&ack).unwrap(), AckResult::Unknown);
+            drop(session);
+            let mut restarted = self::session(&temp, map.clone(), Uuid::new_v4());
+            synchronize(&mut restarted, 2, map.clone());
+            for update in [0, 1, 410] {
+                let decision = restarted
+                    .accept_order(
+                        &command_with_update(2, map.clone(), Uuid::new_v4(), "order-1", update),
+                        NOW.to_owned(),
+                    )
+                    .unwrap();
+                assert!(!decision.apply_to_robot);
+                assert_eq!(decision.code, "ORDER_ALREADY_COMPLETED");
+            }
+        }
+    }
+}
+
+#[test]
+fn delayed_recovery_ack_preserves_new_applied_order_and_rest_matches_ws() {
+    use mapf_rl_simulator::protocol::{ReportBatchItemOutcome, ReportBatchOutcome};
+    for rest in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let map = map();
+        let mut session = session(&temp, map.clone(), Uuid::new_v4());
+        synchronize(&mut session, 1, map.clone());
+        session
+            .accept_order(
+                &command(1, map.clone(), Uuid::new_v4(), "order-1"),
+                NOW.to_owned(),
+            )
+            .unwrap();
+        session.queue_order_completed(500, NOW.to_owned()).unwrap();
+        let ack = completion_ack(
+            &session,
+            "ORDER_RECOVERY_STEP_COMPLETED",
+            ReportDisposition::Duplicate,
+        );
+        session
+            .accept_order(
+                &command_with_update(1, map.clone(), Uuid::new_v4(), "order-1", 1),
+                NOW.to_owned(),
+            )
+            .unwrap();
+        if rest {
+            let outcome = ReportBatchOutcome {
+                request_id: Uuid::new_v4(),
+                outcomes: vec![ReportBatchItemOutcome {
+                    report_message_id: ack.payload.report_message_id,
+                    report_sequence: ack.payload.report_sequence,
+                    disposition: ack.payload.disposition,
+                    durability: ack.payload.durability,
+                    retryable: false,
+                    code: ack.payload.code,
+                }],
+            };
+            assert_eq!(
+                session.accept_report_batch(&outcome).unwrap(),
+                vec![AckResult::Removed]
+            );
+        } else {
+            assert_eq!(session.accept_report_ack(&ack).unwrap(), AckResult::Removed);
+        }
+        assert_eq!(session.spool().applied_order().unwrap().order_update_id, 1);
+        assert!(session.spool().was_completed("order-1", 0));
+        assert!(!session.spool().was_completed("order-1", 1));
+        assert!(!session.spool().was_order_completed("order-1"));
+    }
+}
+
+#[test]
+fn completion_persistence_failure_rolls_back_report_and_both_order_records() {
+    let temp = TempDir::new().unwrap();
+    let map = map();
+    let mut session = session(&temp, map.clone(), Uuid::new_v4());
+    synchronize(&mut session, 1, map.clone());
+    session
+        .accept_order(&command(1, map, Uuid::new_v4(), "order-1"), NOW.to_owned())
+        .unwrap();
+    session.queue_order_completed(500, NOW.to_owned()).unwrap();
+    let ack = completion_ack(
+        &session,
+        "ORDER_TERMINAL_COMPLETED",
+        ReportDisposition::Accepted,
+    );
+    let pending_before = session.spool().pending().len();
+    std::fs::create_dir(temp.path().join("spool.json.tmp")).unwrap();
+    assert!(session.accept_report_ack(&ack).is_err());
+    assert_eq!(session.spool().pending().len(), pending_before);
+    assert!(session.spool().applied_order().is_some());
+    assert!(!session.spool().was_completed("order-1", 0));
+    assert!(!session.spool().was_order_completed("order-1"));
+    std::fs::remove_dir(temp.path().join("spool.json.tmp")).unwrap();
+    session.accept_report_ack(&ack).unwrap();
+    assert!(session.spool().applied_order().is_none());
+    assert!(session.spool().was_order_completed("order-1"));
 }

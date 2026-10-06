@@ -103,6 +103,11 @@ pub struct CoreClient {
 impl CoreClient {
     pub fn new(config: CoreClientConfig) -> Result<Self, CoreClientError> {
         let http = reqwest::Client::builder()
+            .default_headers({
+                let mut headers = map_generation_headers();
+                headers.insert(API_KEY_HEADER, config.api_key.0.clone());
+                headers
+            })
             .timeout(std::time::Duration::from_secs(3))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
@@ -157,6 +162,7 @@ impl CoreClient {
         let mut url = self.config.websocket_url.clone();
         url.set_path("/ws/v1/telemetry");
         let mut request = url.as_str().into_client_request()?;
+        request.headers_mut().extend(map_generation_headers());
         request
             .headers_mut()
             .insert(API_KEY_HEADER, self.config.api_key.0.clone());
@@ -240,6 +246,7 @@ impl CoreClient {
         resume_after: Option<u64>,
     ) -> Result<CoreWebSocket, CoreClientError> {
         let mut request = self.config.websocket_url.as_str().into_client_request()?;
+        request.headers_mut().extend(map_generation_headers());
         request.headers_mut().insert(
             "x-mapf-execution-control",
             HeaderValue::from_static("occupancy-rights-v1"),
@@ -317,6 +324,22 @@ impl CoreWebSocket {
             Err(_) => return Ok(None),
             Ok(frame) => frame.ok_or(CoreClientError::Disconnected)??,
         };
+        self.handle_frame(message).await
+    }
+
+    /// Cancellation-safe read only; callers must complete handle_frame outside select!.
+    pub(crate) async fn read_frame(&mut self) -> Result<Message, CoreClientError> {
+        self.stream
+            .next()
+            .await
+            .ok_or(CoreClientError::Disconnected)?
+            .map_err(CoreClientError::from)
+    }
+
+    pub(crate) async fn handle_frame(
+        &mut self,
+        message: Message,
+    ) -> Result<Option<serde_json::Value>, CoreClientError> {
         match message {
             Message::Text(text) => {
                 if text.len() > MAX_WS_MESSAGE_BYTES {
@@ -503,4 +526,15 @@ fn is_loopback(url: &Url) -> bool {
         Some(url::Host::Ipv6(address)) => address.is_loopback(),
         _ => false,
     }
+}
+
+/// Local map activation fencing; absent outside the single-server local runtime.
+pub(crate) fn map_generation_headers() -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    if let Ok(value) = std::env::var("MAPF_MAP_GENERATION")
+        && let Ok(value) = HeaderValue::from_str(&value)
+    {
+        headers.insert("x-map-generation", value);
+    }
+    headers
 }

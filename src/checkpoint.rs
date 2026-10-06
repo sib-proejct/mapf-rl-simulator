@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const CHECKPOINT_FORMAT_VERSION: u32 = 1;
 pub const MAX_CHECKPOINT_ROBOTS: usize = 10_000;
@@ -192,6 +193,7 @@ struct CheckpointDocument {
 #[derive(Clone, Debug)]
 pub struct CheckpointStore {
     path: PathBuf,
+    last_saved: Arc<Mutex<Option<RecoveryCheckpoint>>>,
 }
 
 impl CheckpointStore {
@@ -200,10 +202,20 @@ impl CheckpointStore {
         if path.parent().is_none() {
             return Err(CheckpointError::InvalidPath);
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            last_saved: Arc::new(Mutex::new(None)),
+        })
     }
 
     pub fn save(&self, checkpoint: &RecoveryCheckpoint) -> Result<(), CheckpointError> {
+        let mut last_saved = self
+            .last_saved
+            .lock()
+            .map_err(|_| CheckpointError::Corrupt)?;
+        if last_saved.as_ref() == Some(checkpoint) {
+            return Ok(());
+        }
         checkpoint.validate()?;
         let body = CheckpointBody {
             format_version: CHECKPOINT_FORMAT_VERSION,
@@ -226,6 +238,7 @@ impl CheckpointStore {
         file.sync_all()?;
         fs::rename(&temporary, &self.path)?;
         File::open(parent)?.sync_all()?;
+        *last_saved = Some(checkpoint.clone());
         Ok(())
     }
 

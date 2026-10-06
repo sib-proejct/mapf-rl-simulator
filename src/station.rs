@@ -1,4 +1,5 @@
 //! Deterministic single-load station actions. Persist before publishing their result.
+use crate::contracts::battery_generated::CHARGE_TARGET_PERCENT;
 use crate::contracts::generated::StationAction;
 use serde::{Deserialize, Serialize};
 
@@ -151,8 +152,8 @@ impl StationState {
             StationAction::Charge => {
                 self.battery_percent = (self.battery_percent
                     + config.charge_percent_per_second * tick_ms as f64 / 1000.0)
-                    .min(100.0);
-                if self.battery_percent >= 100.0 {
+                    .min(CHARGE_TARGET_PERCENT.max(self.battery_percent));
+                if self.battery_percent >= CHARGE_TARGET_PERCENT {
                     self.phase = StationPhase::Completed;
                 }
             }
@@ -236,20 +237,39 @@ mod tests {
         assert!(restored.completed("place", StationAction::Place));
     }
     #[test]
+    fn charge_at_or_above_target_completes_without_reducing_battery() {
+        for percent in [80.0, 95.0, 100.0] {
+            let mut state = StationState {
+                battery_percent: percent,
+                ..StationState::default()
+            };
+            state.advance(
+                "charge",
+                StationAction::Charge,
+                true,
+                100,
+                StationConfig::default(),
+            );
+            assert!(state.completed("charge", StationAction::Charge));
+            assert_eq!(state.battery_percent, percent);
+        }
+    }
+
+    #[test]
     fn invalid_load_actions_fail_and_charge_pauses() {
         let mut state = StationState {
-            battery_percent: 99.0,
+            battery_percent: 79.0,
             ..StationState::default()
         };
         let config = StationConfig::default();
         state.advance("empty", StationAction::Place, true, 100, config);
         assert_eq!(state.phase, StationPhase::Failed);
         state.advance("charge", StationAction::Charge, true, 500, config);
-        assert_eq!(state.battery_percent, 99.5);
+        assert_eq!(state.battery_percent, 79.5);
         state.advance("charge", StationAction::Charge, false, 5000, config);
-        assert_eq!(state.battery_percent, 99.5);
+        assert_eq!(state.battery_percent, 79.5);
         state.advance("charge", StationAction::Charge, true, 500, config);
         assert!(state.completed("charge", StationAction::Charge));
-        assert_eq!(state.battery_percent, 100.0);
+        assert_eq!(state.battery_percent, 80.0);
     }
 }

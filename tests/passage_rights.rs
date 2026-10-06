@@ -36,17 +36,23 @@ fn active(id: &str) -> PlanCoordinator {
     plan
 }
 fn engine(map: &GridMap, id: &str, cell: (u32, u32)) -> SimulationEngine<ManualMonotonicClock> {
+    engine_at_position(
+        map,
+        id,
+        map.grid_to_world(GridCell::new(cell.0, cell.1)).unwrap(),
+    )
+}
+
+fn engine_at_position(
+    map: &GridMap,
+    id: &str,
+    position: WorldPosition,
+) -> SimulationEngine<ManualMonotonicClock> {
     SimulationEngine::new(
         ManualMonotonicClock::default(),
         RobotId::new(id).unwrap(),
         map.clone(),
-        RobotState::new(
-            map.grid_to_world(GridCell::new(cell.0, cell.1)).unwrap(),
-            Velocity::ZERO,
-            Acceleration::ZERO,
-            0.0,
-        )
-        .unwrap(),
+        RobotState::new(position, Velocity::ZERO, Acceleration::ZERO, 0.0).unwrap(),
         EngineConfig {
             motion_limits: MotionLimits::new(1.5, 1.0, 1.5, 6.0, 3.0, 60.0).unwrap(),
             safety: SafetyConfig::new(0.2, 0.05).unwrap(),
@@ -139,6 +145,70 @@ fn crossing_waits_and_resumes_after_estimates_expire() {
             ]),
             &[("a", (0, 3)), ("b", (3, 0))]
         ) > 0
+    );
+}
+
+#[test]
+fn fractional_deadlock_pair_can_escape_without_stationary_padding_cycle() {
+    let map = GridMap::new(32, 20, WorldPosition::new(0.0, 0.0).unwrap(), 1.0, []).unwrap();
+    let a = RobotId::new("r-008").unwrap();
+    let b = RobotId::new("r-010").unwrap();
+    let mut engines = Vec::new();
+    for (id, position) in [
+        (
+            "r-008",
+            WorldPosition::new(14.183466666666668, 2.5).unwrap(),
+        ),
+        (
+            "r-010",
+            WorldPosition::new(13.5, 3.2551316701949484).unwrap(),
+        ),
+    ] {
+        engines.push(engine_at_position(&map, id, position));
+    }
+    let mut fleet = MultiRobotEngine::new(engines, FleetConfig::new(0.5, 50).unwrap()).unwrap();
+    let routes = BTreeMap::from([
+        (
+            a.clone(),
+            route("r-008", vec![(14, 2), (15, 2), (16, 2), (17, 2)]),
+        ),
+        (b.clone(), route("r-010", vec![(13, 3), (12, 3)])),
+    ]);
+    let mut plans = BTreeMap::from([(a.clone(), active("r-008")), (b.clone(), active("r-010"))]);
+    for _ in 0..200 {
+        let mut targets = BTreeMap::new();
+        let mut actions = BTreeMap::new();
+        for (id, robot) in fleet.robots() {
+            let target = motion_target_for_route(
+                robot.map(),
+                robot.state(),
+                robot.simulation_time(),
+                &routes[id],
+            )
+            .unwrap();
+            actions.insert(
+                id.clone(),
+                action_toward_position(robot.state().position(), target.position),
+            );
+            targets.insert(id.clone(), target);
+        }
+        let step = fleet
+            .step_with_passage_rights(&actions, &targets, &mut plans)
+            .unwrap();
+        assert!(step.recovery.is_none(), "{:?}", step.recovery);
+        let left = fleet.robots()[&a].state().position();
+        let right = fleet.robots()[&b].state().position();
+        assert!(
+            (left.x_meters() - right.x_meters()).hypot(left.y_meters() - right.y_meters()) >= 0.5
+        );
+    }
+    assert_eq!(
+        fleet.robots()[&a].state().position(),
+        WorldPosition::new(17.5, 2.5).unwrap()
+    );
+    assert_eq!(
+        fleet.robots()[&b].state().position(),
+        WorldPosition::new(12.5, 3.5).unwrap()
     );
 }
 #[test]
@@ -544,4 +614,95 @@ fn fractional_replan_start_completes_without_repeated_deviation() {
         WorldPosition::new(6.5, 9.5).unwrap()
     );
     assert!(fleet.robots()[&id].state().velocity().magnitude() < 1e-6);
+}
+
+#[test]
+fn parked_blocker_triggers_once_after_threshold_and_resets_on_new_plan() {
+    use mapf_rl_simulator::fleet::RecoveryReason;
+    let map = GridMap::new(
+        32,
+        7,
+        WorldPosition::new(0.0, 0.0).unwrap(),
+        1.0,
+        (0..32).flat_map(|x| [GridCell::new(x, 2), GridCell::new(x, 4)]),
+    )
+    .unwrap();
+    let a = RobotId::new("r-010").unwrap();
+    let b = RobotId::new("r-005").unwrap();
+    let mut fleet = MultiRobotEngine::new(
+        [
+            engine(&map, "r-010", (21, 3)),
+            engine(&map, "r-005", (19, 3)),
+        ],
+        FleetConfig::new(0.5, 3).unwrap(),
+    )
+    .unwrap();
+    let mut plans = BTreeMap::from([
+        (a.clone(), active("r-010")),
+        (b.clone(), PlanCoordinator::new()),
+    ]);
+    let actions = BTreeMap::from([(a.clone(), 4)]);
+    let targets = BTreeMap::from([(
+        a.clone(),
+        map.grid_to_world(GridCell::new(11, 3)).unwrap().into(),
+    )]);
+    for _ in 0..2 {
+        let step = fleet
+            .step_with_passage_rights(&actions, &targets, &mut plans)
+            .unwrap();
+        assert!(step.recovery.is_none());
+        assert!(step.traffic_wait["r-010"].contains("r-005"));
+    }
+    let step = fleet
+        .step_with_passage_rights(&actions, &targets, &mut plans)
+        .unwrap();
+    let recovery = step.recovery.unwrap();
+    assert_eq!(recovery.reason, RecoveryReason::StationaryBlocked);
+    assert_eq!(recovery.held_robots, vec!["r-010"]);
+    assert!(!plans[&a].motion_authorized("r-010"));
+    assert_eq!(
+        fleet.robots()[&b].state().position(),
+        map.grid_to_world(GridCell::new(19, 3)).unwrap()
+    );
+    for _ in 0..5 {
+        assert!(
+            fleet
+                .step_with_passage_rights(&actions, &targets, &mut plans)
+                .unwrap()
+                .recovery
+                .is_none()
+        );
+    }
+    plans.insert(a.clone(), active("r-010"));
+    assert!(
+        fleet
+            .step_with_passage_rights(&actions, &targets, &mut plans)
+            .unwrap()
+            .recovery
+            .is_none()
+    );
+    // Clearing a request discards its accumulated wait.
+    fleet
+        .step_with_passage_rights(&BTreeMap::new(), &BTreeMap::new(), &mut plans)
+        .unwrap();
+    for _ in 0..2 {
+        assert!(
+            fleet
+                .step_with_passage_rights(&actions, &targets, &mut plans)
+                .unwrap()
+                .recovery
+                .is_none()
+        );
+    }
+    // A stationary robot with movement authority is ordinary traffic, not parked.
+    plans.insert(b, active("r-005"));
+    for _ in 0..5 {
+        assert!(
+            fleet
+                .step_with_passage_rights(&actions, &targets, &mut plans)
+                .unwrap()
+                .recovery
+                .is_none()
+        );
+    }
 }
