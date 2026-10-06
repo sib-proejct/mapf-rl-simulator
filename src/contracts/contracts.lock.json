@@ -50,6 +50,7 @@
     "schemas/battery-policy.schema.json": "77fbcafcae6510832670032791e138a7e66b66aa5003abebabad9b1758ff9119",
     "schemas/buffer.schema.json": "bff7328195d66f0e6de2992c7241d2dff5c578ef36b9d87bd4bf0252c2050e75",
     "schemas/common.schema.json": "cd778d005637ba97bf649f1bae5533a3d5dd1f852be85659966c1311a9b0ad5e",
+    "schemas/local-map-control.schema.json": "a00a84bb8b96cdf50f41181c7dfb5f57a37c9c018a7792fee5ec5bc520522e11",
     "schemas/map.schema.json": "c1b47badde547629298e4cd1dca8555d7f64ab350a602359c5962b68d78367ce",
     "schemas/motion-profile.schema.json": "252a4147554377bd013ba5b9d3a4d3647501f317519d25e754a30437be42fa56",
     "schemas/order-queue.schema.json": "3e8c32dc67cf3a4360818937f38c6188add2fd5979e32345ef6ae1406116a303",
@@ -72,5 +73,5 @@
     "vendor/vda5050/ADOPTION.md": "71a20f67c8d204d6e4a5cc97491fa11679b74c21fa573a7dd0c9cec4ffcd3c27"
   },
   "sourceRevision": "WORKTREE",
-  "treeDigestSha256": "df75495f5a4eb82583af3a5f0f5f77b303210141a4e14d0290ddc9c2aa3255fe"
+  "treeDigestSha256": "172a87fa86cfe6f4bd6d6e1bda135e1d3f170162b52dbcd005bf8517c51737b4"
 }

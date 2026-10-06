@@ -875,6 +875,7 @@ impl Provisioner {
         key.set_sensitive(true);
         Ok(Self {
             http: reqwest::Client::builder()
+                .default_headers(crate::core_client::map_generation_headers())
                 .timeout(Duration::from_secs(3))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
