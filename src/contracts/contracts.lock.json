@@ -2,7 +2,8 @@
   "contractVersion": "1.0.0",
   "files": {
     "buffers/warehouse-buffers.json": "758eac884a349dbafc9396cc3690609ffd4307ea729620bd3e973f0a95f3296c",
-    "buffers/warehouse-mega-buffers.json": "bb5a746b58f2cefc8b4f08fef1a5847cf243a6e1e4882b3eaa88da55f12b9003",
+    "buffers/warehouse-mega-buffers-v1.json": "bb5a746b58f2cefc8b4f08fef1a5847cf243a6e1e4882b3eaa88da55f12b9003",
+    "buffers/warehouse-mega-buffers.json": "9296ecf2fd2fd38da9f60e5ceeddd30b88bb0176006d5e2c3a8135405e7b0a85",
     "fixtures/index.json": "64c68c0e98e6d628399830a61dbb42ca2b22e53625624d9da04475fe9855640a",
     "fixtures/invalid/auto-assignment-goal.json": "f19f189968004d408ed9d113b43c00cec98a93cd5c713726d7a980d94a044188",
     "fixtures/invalid/battery-policy-range.json": "e622565eedf8326f0471202db3673d98ca2dbb09cfe765296c5a283809269a68",
@@ -43,7 +44,8 @@
     "fixtures/valid/ws-robot-state-report.json": "17d4140cbf82952479373b15ba48d807a69cb6f5950531372e63506718275991",
     "fixtures/valid/ws-station-command.json": "444550cd2b969046001c9c5d64ef435066a767482ce8044fe6dbca7a9fa4efcc",
     "fixtures/valid/ws-station-state.json": "c1e5f060893bb064b7fc16aa309385db23c5a7308cdd8569eea2461f70bbf7e7",
-    "maps/warehouse-mega-stations.json": "e17a1f6cedefedbcebf2817d3aea014460eaa2bd4dd965c0369252db685d7aba",
+    "maps/warehouse-mega-stations-v1.json": "e17a1f6cedefedbcebf2817d3aea014460eaa2bd4dd965c0369252db685d7aba",
+    "maps/warehouse-mega-stations.json": "b02b495c6d92c9184d6d8a4c9abe5f1ad9bcdb823df12df0521ddeb5c26b0d49",
     "maps/warehouse-stations.json": "67656cc0a68ce03d92f313483f0e3a259436a8c892f3f81523d145dc9ae237f1",
     "openapi/openapi.json": "6b92d6d2cba244043d5b82315c07ccab53a908a1f38669e14ce3cb5646ba5d63",
     "schemas/auto-assignment.schema.json": "496f92d54445aebc3d8ba54c48b146381829250c261bfdce28b93958787b82f1",
@@ -72,6 +74,6 @@
     "vendor/vda5050/3.0.0.lock.json": "f270df03a15ab7ce892d56eee534cab126725ca6bc06cd2f51197581689e3944",
     "vendor/vda5050/ADOPTION.md": "71a20f67c8d204d6e4a5cc97491fa11679b74c21fa573a7dd0c9cec4ffcd3c27"
   },
-  "sourceRevision": "WORKTREE",
-  "treeDigestSha256": "172a87fa86cfe6f4bd6d6e1bda135e1d3f170162b52dbcd005bf8517c51737b4"
+  "sourceRevision": "94bed96f57c20d358101ec32b044e01c3d7a3931-dirty",
+  "treeDigestSha256": "a90d0b54dcae4e5f69513e8e997d016cc366071d2bf966a253a7e702262b685e"
 }

@@ -118,18 +118,29 @@ impl GridMap {
         Ok(self.blocked[(cell.row as usize * self.width as usize) + cell.column as usize])
     }
 
-    pub(crate) fn blocked_cells(&self) -> impl Iterator<Item = GridCell> + '_ {
-        self.blocked
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, blocked)| *blocked)
-            .map(|(index, _)| {
-                GridCell::new(
-                    (index % self.width as usize) as u32,
-                    (index / self.width as usize) as u32,
-                )
+    /// Conservative broad phase; exact clearance is still checked by the safety kernel.
+    pub(crate) fn blocked_cells_in_bounds(
+        &self,
+        bounds: (f64, f64, f64, f64),
+    ) -> impl Iterator<Item = GridCell> + '_ {
+        let index = |value: f64, origin: f64, size: u32| {
+            ((value - origin) / self.resolution.get())
+                .floor()
+                .clamp(0.0, f64::from(size - 1)) as u32
+        };
+        // Include a guard cell on each side for exact grid boundaries and rounding.
+        let min_column = index(bounds.0, self.origin.x_meters(), self.width).saturating_sub(1);
+        let min_row = index(bounds.1, self.origin.y_meters(), self.height).saturating_sub(1);
+        let max_column =
+            (index(bounds.2, self.origin.x_meters(), self.width) + 1).min(self.width - 1);
+        let max_row =
+            (index(bounds.3, self.origin.y_meters(), self.height) + 1).min(self.height - 1);
+        (min_row..=max_row).flat_map(move |row| {
+            (min_column..=max_column).filter_map(move |column| {
+                self.blocked[row as usize * self.width as usize + column as usize]
+                    .then_some(GridCell::new(column, row))
             })
+        })
     }
 
     pub(crate) fn cell_bounds(&self, cell: GridCell) -> (f64, f64, f64, f64) {

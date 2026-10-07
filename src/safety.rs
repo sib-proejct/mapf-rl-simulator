@@ -414,7 +414,13 @@ impl SafetyKernel {
             }
         }
         let required_squared = required * required;
-        for cell in map.blocked_cells() {
+        let swept_bounds = (
+            start.x_meters().min(end.x_meters()) - required,
+            start.y_meters().min(end.y_meters()) - required,
+            start.x_meters().max(end.x_meters()) + required,
+            start.y_meters().max(end.y_meters()) + required,
+        );
+        for cell in map.blocked_cells_in_bounds(swept_bounds) {
             let bounds = map.cell_bounds(cell);
             if segment_aabb_distance_squared(start, end, bounds) < required_squared {
                 return Err(SafetyReason::StaticObstacleClearance);
@@ -568,6 +574,58 @@ mod tests {
     use crate::motion::ActuatorEffect;
     use crate::types::{Acceleration, Velocity, WorldPosition};
     use crate::world::GridCell;
+
+    #[test]
+    fn bounded_clearance_matches_full_map_scan() {
+        for resolution in [0.1, 1.0, 2.5] {
+            let origin = WorldPosition::new(-7.25, 3.5).unwrap();
+            let cells: Vec<_> = (0..40)
+                .flat_map(|row| (0..64).map(move |column| GridCell::new(column, row)))
+                .filter(|cell| (cell.column() + 3 * cell.row()) % 7 == 0)
+                .collect();
+            let map = GridMap::new(64, 40, origin, resolution, cells.iter().copied()).unwrap();
+            let kernel = SafetyKernel::new(SafetyConfig::new(0.2, 0.05).unwrap());
+            // Stationary, short, long, reversed and diagonal sweeps; include exact cell edges.
+            for sample in 0..400 {
+                let point = |column: f64, row: f64| {
+                    WorldPosition::new(
+                        origin.x_meters() + column * resolution,
+                        origin.y_meters() + row * resolution,
+                    )
+                    .unwrap()
+                };
+                let start = point(f64::from(sample % 64), f64::from(sample * 13 % 40));
+                let end = match sample % 4 {
+                    0 => start,
+                    1 => point(
+                        f64::from(sample % 64) + 0.2,
+                        f64::from(sample * 13 % 40) + 0.1,
+                    ),
+                    _ => point(f64::from(sample * 17 % 64), f64::from(sample * 23 % 40)),
+                };
+                let margin = f64::from(sample % 5) * 0.1;
+                let required = kernel.config.required_clearance() + margin;
+                let (min_x, min_y, max_x, max_y) = map.world_bounds();
+                let boundary = [start, end].iter().any(|position| {
+                    position.x_meters() - min_x < required
+                        || max_x - position.x_meters() < required
+                        || position.y_meters() - min_y < required
+                        || max_y - position.y_meters() < required
+                });
+                let expected = if boundary {
+                    Err(SafetyReason::MapBoundary)
+                } else if cells.iter().any(|cell| {
+                    segment_aabb_distance_squared(start, end, map.cell_bounds(*cell))
+                        < required * required
+                }) {
+                    Err(SafetyReason::StaticObstacleClearance)
+                } else {
+                    Ok(())
+                };
+                assert_eq!(kernel.segment_clearance(&map, start, end, margin), expected);
+            }
+        }
+    }
 
     #[test]
     fn swept_circle_rejects_an_obstacle_before_commit() {

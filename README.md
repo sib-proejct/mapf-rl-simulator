@@ -113,6 +113,11 @@ identity/content가 일치하지 않으면 motion을 시작하기 전에 실패�
 
 동일 scenario와 seed는 wall clock이나 실행 thread와 무관하게 같은 SHA-256 state digest를 출력한다.
 
+정적 장애물 clearance 검사는 이동 선분과 footprint·clearance·곡률 여유를 포함한
+bounding box의 셀만 순회한다. 셀 경계의 반올림을 고려해 양쪽에 한 셀씩 추가하며,
+기존 선분–셀 거리 판정과 맵 경계 검사는 그대로 유지한다. 물리·안전 tick과 telemetry 주기는 바꾸지 않는다.
+메가 맵을 포함한 전체 순회 방식과의 동등성 검사는 `cargo test --lib safety::tests`로 실행한다.
+
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
